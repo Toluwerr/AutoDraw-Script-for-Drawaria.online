@@ -1,3054 +1,3210 @@
-// Paste this script into the drawaria.online console to auto-draw any image
-// by replaying pixel-perfect strokes through Drawaria's websocket channel.
-(() => {
-  const SCRIPT_HANDLE = '__drawariaImageAutodraw';
-  const MAX_COLOUR_CAPACITY = 1300;
-
-  if (window[SCRIPT_HANDLE]?.cleanup) {
+(async () => {
+  const previous = window.__drawariaOmniDraw;
+  if (previous && typeof previous.destroy === 'function') {
     try {
-      window[SCRIPT_HANDLE].cleanup();
+      previous.destroy();
     } catch (err) {
-      console.warn('drawaria image autodraw: cleanup error from previous run', err);
+      console.warn('Previous Drawaria automation teardown error', err);
     }
   }
 
   const state = {
-    running: false,
-    abortRequested: false,
-    prepared: false,
-    previewDataUrl: null,
-    pixelWidth: 0,
-    pixelHeight: 0,
+    canvas: null,
+    root: null,
+    panel: null,
+    style: null,
+    drag: null,
+    tabs: new Map(),
+    activeTab: 'image',
+    preview: {
+      canvas: null,
+      ctx: null,
+      playing: false,
+      raf: null,
+      drawnSegments: 0,
+    },
+    config: {
+      resolution: 650,
+      strokeDensity: 1,
+      scanMode: 'smart',
+      serpentine: true,
+      lighten: 0,
+      colorTolerance: 18,
+      maxColors: 200,
+      scale: 1,
+      offsetX: 0,
+      offsetY: 0,
+      align: 'center',
+      strokeDelay: 3,
+      colorDelay: 110,
+      pointerStep: 6,
+      previewDuration: 8,
+    },
+    image: null,
+    commands: null,
+    progress: { segments: 0, total: 0 },
+    drawing: false,
+    abort: false,
+    palettePointerId: Math.floor(Math.random() * 1e6) + 1,
     palette: [],
-    paletteUsage: [],
-    assignments: null,
-    sourceImageData: null,
-    paletteSortMode: 'dark-first',
-    selection: null,
-    settings: {
-      smoothnessPercent: 40,
-      laneFanMultiplier: 100,
-      coverageBoost: 100,
-      detailMode: 'balanced',
-      lowResEnhancer: true,
-      edgeDetail: true,
-      microDetail: true,
-      autoStart: false,
-      ditherStrength: 100,
-      adaptiveTheme: true,
-      spectralBoost: 120,
-      highlightGlaze: true,
-      textureWeave: false,
-      gradientEcho: true,
+    colorCache: new Map(),
+    initialColorHex: null,
+    currentSwatch: null,
+    fleet: [],
+    ui: {
+      progressText: null,
+      progressBar: null,
+      startBtn: null,
+      stopBtn: null,
+      previewSlider: null,
+      previewPlay: null,
+      previewPause: null,
+      previewReset: null,
+      connectionStatus: null,
+      botStatus: null,
+      fleetList: null,
     },
-    metrics: {
-      pixelCount: 0,
-      paletteCount: 0,
-      estimatedStrokes: 0,
-      estimatedDurationMs: 0,
-      laneCount: 0,
-      scaleFactor: 1,
-      boardWidth: 0,
-      boardHeight: 0,
-      targetWidth: 0,
-      targetHeight: 0,
-      selectionActive: false,
-    },
-    commandCache: null,
+    rebuildTimer: null,
+    keyHandler: null,
+    network: null,
+    bot: null,
   };
 
-  const funState = {
-    running: false,
-    abortRequested: false,
-    pointerId: 8807,
-    activeFeature: null,
-  };
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const funSettings = {
-    density: 70,
-    tempo: 60,
-    mirror: true,
-    jitter: true,
-  };
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
-  const cleanupCallbacks = [];
-
-  const wsBridge = installSocketBridge();
-  cleanupCallbacks.push(() => wsBridge.release());
-
-  function registerCleanup(fn) {
-    cleanupCallbacks.push(fn);
-  }
-
-  function runCleanup() {
-    while (cleanupCallbacks.length) {
-      const fn = cleanupCallbacks.pop();
-      try {
-        fn();
-      } catch (err) {
-        console.warn('drawaria image autodraw: cleanup callback failed', err);
-      }
-    }
-    delete window[SCRIPT_HANDLE];
-  }
-
-  function hexToRgb(hex) {
-    const normalised = hex.replace('#', '');
-    if (normalised.length !== 6) {
-      return { r: 37, g: 99, b: 235 };
-    }
-    return {
-      r: parseInt(normalised.slice(0, 2), 16),
-      g: parseInt(normalised.slice(2, 4), 16),
-      b: parseInt(normalised.slice(4, 6), 16),
-    };
-  }
-
-  function rgbToHex(r, g, b) {
-    return `#${[r, g, b]
-      .map((channel) => Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, '0'))
-      .join('')}`;
-  }
-
-  function mixHex(baseHex, targetHex, amount) {
-    const base = hexToRgb(baseHex);
-    const target = hexToRgb(targetHex);
-    const ratio = Math.max(0, Math.min(1, amount));
-    const inv = 1 - ratio;
-    return rgbToHex(
-      base.r * inv + target.r * ratio,
-      base.g * inv + target.g * ratio,
-      base.b * inv + target.b * ratio
-    );
-  }
-
-  function lightenHex(hex, amount) {
-    return mixHex(hex, '#ffffff', amount);
-  }
-
-  function darkenHex(hex, amount) {
-    return mixHex(hex, '#000000', amount);
-  }
-
-  function computeColourProfile(colour) {
-    if (!colour) {
-      return {
-        luminance: 0,
-        saturation: 0,
-        value: 0,
-        lightness: 0,
-      };
-    }
-    const r = (colour.r ?? 0) / 255;
-    const g = (colour.g ?? 0) / 255;
-    const b = (colour.b ?? 0) / 255;
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-    const chroma = max - min;
-    const saturation = max === 0 ? 0 : chroma / max;
-    const lightness = (max + min) / 2;
-    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    return {
-      luminance,
-      saturation,
-      value: max,
-      lightness,
-    };
-  }
-
-  function formatNumber(value) {
-    if (typeof value !== 'number' || Number.isNaN(value)) {
-      return '—';
-    }
-    return value.toLocaleString('en-US');
-  }
-
-  function formatDuration(ms) {
-    if (!ms || ms <= 0) {
-      return '0s';
-    }
-    const seconds = ms / 1000;
-    if (seconds < 60) {
-      return `${seconds.toFixed(Math.max(0, seconds >= 10 ? 0 : 1))}s`;
-    }
-    const minutes = Math.floor(seconds / 60);
-    const remaining = Math.round(seconds % 60);
-    return `${minutes}m ${remaining.toString().padStart(2, '0')}s`;
-  }
-
-  class AbortPainting extends Error {
-    constructor() {
-      super('Drawing aborted');
-      this.name = 'AbortPainting';
-    }
-  }
-
-  class FunAbort extends Error {
-    constructor() {
-      super('Fun effect aborted');
-      this.name = 'FunAbort';
-    }
-  }
-
-  function ensureNotAborted() {
-    if (state.abortRequested) {
-      throw new AbortPainting();
-    }
-  }
-
-  function ensureFunNotAborted() {
-    if (funState.abortRequested) {
-      throw new FunAbort();
-    }
-  }
-
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  const ui = createPanel();
-  ui.paletteOrderSelect.value = state.paletteSortMode;
-  registerCleanup(() => {
-    ui.panel.remove();
-    ui.style.remove();
+  const globalNetwork = (window.__drawariaOmniNetwork = window.__drawariaOmniNetwork || {
+    sockets: new Set(),
+    meta: new Map(),
   });
+  state.network = globalNetwork;
 
-  registerCleanup(() => {
-    funState.abortRequested = true;
-  });
-
-  const hiddenCanvas = document.createElement('canvas');
-  const hiddenCtx = hiddenCanvas.getContext('2d', { willReadFrequently: true });
-
-  let metricsUpdateScheduled = false;
-
-  async function loadImageFromFile(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = reject;
-        img.src = event.target.result;
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  }
-
-  function resizeImageToFit(img, maxDimension) {
-    const scale = Math.min(1, maxDimension / Math.max(img.width, img.height));
-    const width = Math.max(1, Math.round(img.width * scale));
-    const height = Math.max(1, Math.round(img.height * scale));
-    hiddenCanvas.width = width;
-    hiddenCanvas.height = height;
-    hiddenCtx.clearRect(0, 0, width, height);
-    hiddenCtx.imageSmoothingEnabled = true;
-    hiddenCtx.imageSmoothingQuality = 'high';
-    hiddenCtx.drawImage(img, 0, 0, width, height);
-    return hiddenCtx.getImageData(0, 0, width, height);
-  }
-
-  function previewImage(img, width, height) {
-    const ctx = ui.previewCanvas.getContext('2d');
-    const { width: previewW, height: previewH } = ui.previewCanvas;
-    ctx.clearRect(0, 0, previewW, previewH);
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, previewW, previewH);
-    ctx.save();
-    ctx.shadowColor = 'rgba(15,23,42,0.45)';
-    ctx.shadowBlur = 28;
-    const scale = Math.min((previewW - 40) / width, (previewH - 40) / height);
-    const drawW = width * scale;
-    const drawH = height * scale;
-    ctx.drawImage(hiddenCanvas, 0, 0, width, height, (previewW - drawW) / 2, (previewH - drawH) / 2, drawW, drawH);
-    ctx.restore();
-  }
-
-  function quantizeToPalette(imageData, width, height, maxColors) {
-    const data = imageData.data;
-    const totalPixels = width * height;
-
-    const map = new Map();
-
-    for (let i = 0; i < totalPixels; i++) {
-      const offset = i * 4;
-      const alpha = data[offset + 3];
-      if (alpha < 16) {
-        continue;
-      }
-      const r = data[offset];
-      const g = data[offset + 1];
-      const b = data[offset + 2];
-      const key = (r << 16) | (g << 8) | b;
-      const record = map.get(key);
-      if (record) {
-        record.count += 1;
-      } else {
-        map.set(key, { r, g, b, count: 1 });
-      }
-    }
-
-    if (!map.size) {
-      const fallbackPalette = [{ r: 0, g: 0, b: 0, hex: '#000000' }];
-      return {
-        palette: fallbackPalette,
-        assignments: new Uint16Array(totalPixels).fill(0xffff),
-      };
-    }
-
-    const colours = Array.from(map.values());
-    const targetColors = Math.max(1, Math.min(maxColors, colours.length));
-
-    const boxes = [createColorBox(colours.map((_, idx) => idx), colours)];
-
-    while (boxes.length < targetColors) {
-      boxes.sort((a, b) => b.score - a.score);
-      const box = boxes.shift();
-      if (!box || box.indices.length <= 1) {
-        if (box) {
-          boxes.unshift(box);
-        }
-        break;
-      }
-      const split = splitBox(box, colours);
-      if (!split || !split.low.indices.length || !split.high.indices.length) {
-        boxes.unshift(box);
-        break;
-      }
-      boxes.push(split.low, split.high);
-    }
-
-    const palette = boxes.map((box) => {
-      let total = 0;
-      let rSum = 0;
-      let gSum = 0;
-      let bSum = 0;
-      for (const idx of box.indices) {
-        const colour = colours[idx];
-        total += colour.count;
-        rSum += colour.r * colour.count;
-        gSum += colour.g * colour.count;
-        bSum += colour.b * colour.count;
-      }
-      if (!total) {
-        total = 1;
-      }
-      const r = Math.round(rSum / total);
-      const g = Math.round(gSum / total);
-      const b = Math.round(bSum / total);
-      return {
-        r,
-        g,
-        b,
-        hex: `#${[r, g, b]
-          .map((component) => component.toString(16).padStart(2, '0'))
-          .join('')}`,
-      };
-    });
-
-    const assignments = assignPaletteWithDithering(imageData, width, height, palette);
-
-    return { palette, assignments };
-  }
-
-  function createColorBox(indices, colours) {
-    let rMin = 255;
-    let rMax = 0;
-    let gMin = 255;
-    let gMax = 0;
-    let bMin = 255;
-    let bMax = 0;
-    let population = 0;
-
-    for (const idx of indices) {
-      const colour = colours[idx];
-      rMin = Math.min(rMin, colour.r);
-      rMax = Math.max(rMax, colour.r);
-      gMin = Math.min(gMin, colour.g);
-      gMax = Math.max(gMax, colour.g);
-      bMin = Math.min(bMin, colour.b);
-      bMax = Math.max(bMax, colour.b);
-      population += colour.count;
-    }
-
-    const rRange = rMax - rMin;
-    const gRange = gMax - gMin;
-    const bRange = bMax - bMin;
-    const maxRange = Math.max(rRange, gRange, bRange, 1);
-
-    return {
-      indices,
-      population,
-      rRange,
-      gRange,
-      bRange,
-      score: maxRange * Math.log(population + 1),
-    };
-  }
-
-  function splitBox(box, colours) {
-    const { rRange, gRange, bRange } = box;
-    let component = 'r';
-    if (gRange >= rRange && gRange >= bRange) {
-      component = 'g';
-    } else if (bRange >= rRange && bRange >= gRange) {
-      component = 'b';
-    }
-
-    const sorted = [...box.indices].sort((a, b) => colours[a][component] - colours[b][component]);
-    if (!sorted.length) {
-      return null;
-    }
-    const total = sorted.reduce((acc, idx) => acc + colours[idx].count, 0);
-    let midpoint = total / 2;
-    let low = [];
-    let high = [];
-    let accumulator = 0;
-
-    for (const idx of sorted) {
-      if (accumulator < midpoint) {
-        low.push(idx);
-      } else {
-        high.push(idx);
-      }
-      accumulator += colours[idx].count;
-    }
-
-    if (!low.length || !high.length) {
-      const half = Math.ceil(sorted.length / 2);
-      low = sorted.slice(0, half);
-      high = sorted.slice(half);
-    }
-
-    return {
-      low: createColorBox(low, colours),
-      high: createColorBox(high, colours),
-    };
-  }
-
-  function perceptualColourDistance(r1, g1, b1, r2, g2, b2) {
-    const rMean = (r1 + r2) / 2;
-    const dR = r1 - r2;
-    const dG = g1 - g2;
-    const dB = b1 - b2;
-    return (
-      (2 + rMean / 256) * dR * dR +
-      4 * dG * dG +
-      (2 + (255 - rMean) / 256) * dB * dB
-    );
-  }
-
-  function clampChannel(value) {
-    return Math.max(0, Math.min(255, value));
-  }
-
-  function assignPaletteWithDithering(imageData, width, height, palette) {
-    const totalPixels = width * height;
-    const assignments = new Uint16Array(totalPixels);
-    if (!palette.length) {
-      assignments.fill(0xffff);
-      return assignments;
-    }
-
-    const ditherScale = (state.settings?.ditherStrength ?? 100) / 100;
-    const data = imageData.data;
-    const alphaChannel = new Uint8Array(totalPixels);
-    const rBuffer = new Float32Array(totalPixels);
-    const gBuffer = new Float32Array(totalPixels);
-    const bBuffer = new Float32Array(totalPixels);
-
-    for (let i = 0; i < totalPixels; i++) {
-      const offset = i * 4;
-      alphaChannel[i] = data[offset + 3];
-      rBuffer[i] = data[offset];
-      gBuffer[i] = data[offset + 1];
-      bBuffer[i] = data[offset + 2];
-    }
-
-    const findNearest = (r, g, b) => {
-      let bestIndex = 0;
-      let bestDistance = Infinity;
-      for (let j = 0; j < palette.length; j++) {
-        const colour = palette[j];
-        const distance = perceptualColourDistance(r, g, b, colour.r, colour.g, colour.b);
-        if (distance < bestDistance) {
-          bestDistance = distance;
-          bestIndex = j;
-        }
-      }
-      return bestIndex;
-    };
-
-    const distributeError = (x, y, errR, errG, errB, factor) => {
-      if (ditherScale <= 0) {
-        return;
-      }
-      if (x < 0 || x >= width || y < 0 || y >= height) {
-        return;
-      }
-      const idx = y * width + x;
-      if (alphaChannel[idx] < 16) {
-        return;
-      }
-      const scaledFactor = factor * ditherScale;
-      rBuffer[idx] += errR * scaledFactor;
-      gBuffer[idx] += errG * scaledFactor;
-      bBuffer[idx] += errB * scaledFactor;
-    };
-
-    for (let y = 0; y < height; y++) {
-      const serpentine = y % 2 === 1;
-      if (serpentine) {
-        for (let x = width - 1; x >= 0; x--) {
-          const idx = y * width + x;
-          if (alphaChannel[idx] < 16) {
-            assignments[idx] = 0xffff;
-            continue;
-          }
-          const sourceR = clampChannel(rBuffer[idx]);
-          const sourceG = clampChannel(gBuffer[idx]);
-          const sourceB = clampChannel(bBuffer[idx]);
-          const paletteIndex = findNearest(sourceR, sourceG, sourceB);
-          assignments[idx] = paletteIndex;
-          const target = palette[paletteIndex];
-          const errR = sourceR - target.r;
-          const errG = sourceG - target.g;
-          const errB = sourceB - target.b;
-          distributeError(x - 1, y, errR, errG, errB, 7 / 16);
-          distributeError(x + 1, y + 1, errR, errG, errB, 3 / 16);
-          distributeError(x, y + 1, errR, errG, errB, 5 / 16);
-          distributeError(x - 1, y + 1, errR, errG, errB, 1 / 16);
-        }
-      } else {
-        for (let x = 0; x < width; x++) {
-          const idx = y * width + x;
-          if (alphaChannel[idx] < 16) {
-            assignments[idx] = 0xffff;
-            continue;
-          }
-          const sourceR = clampChannel(rBuffer[idx]);
-          const sourceG = clampChannel(gBuffer[idx]);
-          const sourceB = clampChannel(bBuffer[idx]);
-          const paletteIndex = findNearest(sourceR, sourceG, sourceB);
-          assignments[idx] = paletteIndex;
-          const target = palette[paletteIndex];
-          const errR = sourceR - target.r;
-          const errG = sourceG - target.g;
-          const errB = sourceB - target.b;
-          distributeError(x + 1, y, errR, errG, errB, 7 / 16);
-          distributeError(x - 1, y + 1, errR, errG, errB, 3 / 16);
-          distributeError(x, y + 1, errR, errG, errB, 5 / 16);
-          distributeError(x + 1, y + 1, errR, errG, errB, 1 / 16);
-        }
-      }
-    }
-
-    return assignments;
-  }
-
-  function renderPaletteSwatches(palette, usage = []) {
-    if (!ui.paletteStrip) {
+  function setupSocketTracking() {
+    if (window.__drawariaOmniSocketPatched) {
       return;
     }
-    ui.paletteStrip.innerHTML = '';
-    let dominantIndex = 0;
-    if (usage.length) {
-      let best = -Infinity;
-      usage.forEach((value, index) => {
-        if (value > best) {
-          best = value;
-          dominantIndex = index;
-        }
-      });
-    }
-    const totalUsage = usage.reduce((acc, value) => acc + value, 0) || 1;
-    palette.forEach((color, index) => {
-      const swatch = document.createElement('div');
-      swatch.className = 'pxa-swatch';
-      swatch.style.background = color.hex;
-      if (index === dominantIndex) {
-        swatch.dataset.dominant = 'true';
-      }
-      const percentage = usage[index] ? ((usage[index] / totalUsage) * 100).toFixed(2) : null;
-      swatch.title = `${index + 1}. ${color.hex}${percentage ? ` • ${percentage}%` : ''}`;
-      ui.paletteStrip.appendChild(swatch);
-    });
-    const summaryText = `${palette.length} colours (max ${MAX_COLOUR_CAPACITY})`;
-    if (ui.paletteSummary) {
-      ui.paletteSummary.textContent = summaryText;
-    }
-    if (ui.paletteSummarySecondary) {
-      ui.paletteSummarySecondary.textContent = summaryText;
-    }
-  }
-
-  function renderPaletteInsights(palette, usage = []) {
-    if (!ui.paletteInsights) {
-      return;
-    }
-    ui.paletteInsights.innerHTML = '';
-    if (!palette.length) {
-      const emptyCard = document.createElement('div');
-      emptyCard.className = 'pxa-insight-card';
-      emptyCard.innerHTML = '<strong>Palette pending</strong><span>Import an image to unlock coverage analytics and colour rankings.</span>';
-      ui.paletteInsights.appendChild(emptyCard);
-      return;
-    }
-    const totalUsage = usage.reduce((acc, value) => acc + value, 0) || 1;
-    const ranked = palette
-      .map((colour, index) => ({
-        index,
-        hex: colour.hex,
-        percent: usage[index] ? (usage[index] / totalUsage) * 100 : 0,
-      }))
-      .sort((a, b) => b.percent - a.percent)
-      .slice(0, 4);
-    const topColoursCard = document.createElement('div');
-    topColoursCard.className = 'pxa-insight-card';
-    topColoursCard.innerHTML = `<strong>Dominant colours</strong>${ranked
-      .map((entry) => `<span>${entry.index + 1}. ${entry.hex} — ${entry.percent.toFixed(2)}%</span>`)
-      .join('')}`;
-    ui.paletteInsights.appendChild(topColoursCard);
-
-    const cadenceCard = document.createElement('div');
-    cadenceCard.className = 'pxa-insight-card';
-    cadenceCard.innerHTML = `<strong>Stroke cadence</strong><span>${formatNumber(
-      state.metrics.estimatedStrokes
-    )} planned strokes • lane fan ×${state.metrics.laneCount || 1}</span><span>Smoothness ${state.settings.smoothnessPercent}% • Coverage ${state.settings.coverageBoost}%</span>`;
-    ui.paletteInsights.appendChild(cadenceCard);
-
-    const detailLabels = {
-      balanced: 'Balanced detail',
-      max: 'Maximum detail',
-      minimal: 'Minimal detail',
+    const originalSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function patchedSend(...args) {
+      trackSocket(this);
+      return originalSend.apply(this, args);
     };
-    const detailCard = document.createElement('div');
-    detailCard.className = 'pxa-insight-card';
-    detailCard.innerHTML = `<strong>Detail profile</strong><span>${
-      detailLabels[state.settings.detailMode] || state.settings.detailMode
-    }</span><span>Dither strength ${state.settings.ditherStrength}% • Low-res enhancer ${
-      state.settings.lowResEnhancer ? 'on' : 'off'
-    }</span>`;
-    ui.paletteInsights.appendChild(detailCard);
-
-    const harmonyCard = document.createElement('div');
-    harmonyCard.className = 'pxa-insight-card';
-    harmonyCard.innerHTML = `<strong>Harmony engines</strong><span>Spectral accent ${
-      state.settings.spectralBoost
-    }%</span><span>Glow ${state.settings.highlightGlaze !== false ? 'on' : 'off'} • Texture ${
-      state.settings.textureWeave ? 'on' : 'off'
-    } • Echo ${state.settings.gradientEcho !== false ? 'on' : 'off'}</span>`;
-    ui.paletteInsights.appendChild(harmonyCard);
+    window.__drawariaOmniSocketPatched = true;
+    if (!window.__drawariaOmniOriginalWSSend) {
+      window.__drawariaOmniOriginalWSSend = originalSend;
+    }
   }
 
-  function applyPanelThemeFromPalette(palette, usage = []) {
-    if (!ui.panel) {
+  function trackSocket(ws) {
+    if (!ws || typeof ws.addEventListener !== 'function') {
       return;
     }
-    if (state.settings.adaptiveTheme === false || !palette.length) {
-      ui.panel.style.setProperty('--pxa-accent', '#2563eb');
-      ui.panel.style.setProperty('--pxa-accent-dark', '#1e3a8a');
-      ui.panel.style.setProperty('--pxa-accent-soft', 'rgba(37,99,235,0.16)');
-      ui.panel.style.setProperty('--pxa-ambient', 'rgba(148,163,184,0.22)');
-      return;
-    }
-    let dominantIndex = 0;
-    if (usage.length) {
-      let best = -Infinity;
-      usage.forEach((value, index) => {
-        if (value > best) {
-          best = value;
-          dominantIndex = index;
-        }
-      });
-    }
-    const accent = palette[dominantIndex]?.hex || '#2563eb';
-    ui.panel.style.setProperty('--pxa-accent', accent);
-    ui.panel.style.setProperty('--pxa-accent-dark', darkenHex(accent, 0.35));
-    ui.panel.style.setProperty('--pxa-accent-soft', lightenHex(accent, 0.75));
-    ui.panel.style.setProperty('--pxa-ambient', lightenHex(accent, 0.9));
-  }
-
-  function updateModeLabel() {
-    if (!ui.modeLabel) {
-      return;
-    }
-    const detailLabels = {
-      balanced: 'Balanced detail',
-      max: 'Maximum detail',
-      minimal: 'Minimal detail',
-    };
-    const detailLabel = detailLabels[state.settings.detailMode] || state.settings.detailMode;
-    const extras = [];
-    if (state.settings.highlightGlaze !== false) {
-      extras.push('glow glaze');
-    }
-    if (state.settings.textureWeave) {
-      extras.push('texture weave');
-    }
-    if (state.settings.gradientEcho !== false) {
-      extras.push('edge echo');
-    }
-    ui.modeLabel.textContent = `${detailLabel} • ${state.settings.smoothnessPercent}% smooth${
-      extras.length ? ` • ${extras.join(' + ')}` : ''
-    }`;
-  }
-
-  const funFeatures = {
-    aurora: {
-      label: 'Aurora sweep',
-      description: 'Layered sine ribbons glide horizontally with pointer-drawn passes.',
-      estimate(region, options) {
-        const stripes = Math.max(3, Math.round((options.density || 0) / 12));
-        return Math.max(1, stripes * (options.mirror ? 2 : 1));
-      },
-      async run(ctx) {
-        const stripes = Math.max(3, Math.round((ctx.options.density || 0) / 12));
-        const width = Math.max(1, ctx.region.width);
-        const height = Math.max(1, ctx.region.height);
-        const baseAmplitude = Math.max(4, height / Math.max(6, stripes * 2));
-        const steps = Math.max(60, Math.round(width / 3));
-        for (let lane = 0; lane < stripes; lane += 1) {
-          ctx.ensureActive();
-          const amplitude = baseAmplitude * (1 + lane / (stripes * 1.25));
-          const frequency = 1.6 + lane * 0.35;
-          const centerY = ctx.region.y + (height / (stripes + 1)) * (lane + 0.6);
-          const path = [];
-          for (let step = 0; step <= steps; step += 1) {
-            const t = step / steps;
-            let x = ctx.region.x + t * width;
-            let y = centerY + Math.sin(t * Math.PI * frequency + lane * 0.4) * amplitude;
-            if (ctx.options.jitter) {
-              y += Math.cos((t * Math.PI * 6) + lane) * amplitude * 0.18;
-            }
-            x = clamp(x, ctx.minCanvasX, ctx.maxCanvasX);
-            y = clamp(y, ctx.minCanvasY, ctx.maxCanvasY);
-            path.push({ x, y });
-          }
-          await ctx.stroke(path, 0.58);
-          ctx.advanceProgress();
-          if (ctx.options.mirror) {
-            const mirrored = path.map((point, index) => {
-              const offset = ctx.options.jitter ? Math.sin(index * 0.25) * amplitude * 0.08 : 0;
-              return {
-                x: clamp(ctx.region.x + ctx.region.width - (point.x - ctx.region.x), ctx.minCanvasX, ctx.maxCanvasX),
-                y: clamp(point.y + offset, ctx.minCanvasY, ctx.maxCanvasY),
-              };
-            });
-            await ctx.stroke(mirrored, 0.58);
-            ctx.advanceProgress();
-          }
-        }
-      },
-    },
-    vortex: {
-      label: 'Vortex bloom',
-      description: 'Spirals orbit from the centre to sketch swirling blooms with pointer strokes.',
-      estimate(region, options) {
-        const arms = options.mirror ? 4 : 3;
-        return Math.max(arms, 1);
-      },
-      async run(ctx) {
-        const arms = ctx.options.mirror ? 4 : 3;
-        const loops = Math.max(3, Math.round((ctx.options.density || 0) / 15));
-        const steps = loops * 160;
-        for (let arm = 0; arm < arms; arm += 1) {
-          ctx.ensureActive();
-          const offset = (2 * Math.PI * arm) / arms;
-          const path = [];
-          for (let step = 0; step <= steps; step += 1) {
-            const t = step / steps;
-            const angle = t * loops * Math.PI * 2 + offset;
-            let radius = (Math.min(ctx.region.width, ctx.region.height) / 2) * Math.pow(t, 0.9);
-            if (ctx.options.jitter) {
-              radius += Math.sin(angle * 0.6) * radius * 0.08;
-            }
-            let x = ctx.region.x + ctx.region.width / 2 + Math.cos(angle) * radius;
-            let y = ctx.region.y + ctx.region.height / 2 + Math.sin(angle) * radius * (ctx.options.mirror ? 0.9 : 1);
-            x = clamp(x, ctx.minCanvasX, ctx.maxCanvasX);
-            y = clamp(y, ctx.minCanvasY, ctx.maxCanvasY);
-            path.push({ x, y });
-          }
-          await ctx.stroke(path, 0.5);
-          ctx.advanceProgress();
-        }
-      },
-    },
-    firefly: {
-      label: 'Firefly scatter',
-      description: 'Launches sparkling bursts of short pointer flutters across the region.',
-      estimate(region, options) {
-        const base = Math.max(12, Math.round((options.density || 0) * 0.8));
-        return Math.max(1, base * (options.mirror ? 2 : 1));
-      },
-      async run(ctx) {
-        const base = Math.max(12, Math.round((ctx.options.density || 0) * 0.8));
-        for (let i = 0; i < base; i += 1) {
-          ctx.ensureActive();
-          const originX = ctx.region.x + ctx.random() * ctx.region.width;
-          const originY = ctx.region.y + ctx.random() * ctx.region.height;
-          const heading = ctx.random() * Math.PI * 2;
-          const length = Math.max(10, Math.min(ctx.region.width, ctx.region.height) * (0.18 + ctx.random() * 0.12));
-          const segments = 4 + Math.floor(ctx.random() * 4);
-          const path = [];
-          for (let s = 0; s <= segments; s += 1) {
-            const t = s / segments;
-            const curve = Math.sin(t * Math.PI);
-            let x = originX + Math.cos(heading) * length * t;
-            let y = originY + Math.sin(heading) * length * t + curve * length * 0.25;
-            if (ctx.options.jitter) {
-              x += (ctx.random() - 0.5) * length * 0.18;
-              y += (ctx.random() - 0.5) * length * 0.12;
-            }
-            x = clamp(x, ctx.minCanvasX, ctx.maxCanvasX);
-            y = clamp(y, ctx.minCanvasY, ctx.maxCanvasY);
-            path.push({ x, y });
-          }
-          await ctx.stroke(path, 0.45);
-          ctx.advanceProgress();
-          if (ctx.options.mirror) {
-            const mirrored = path.map((point) => ({
-              x: clamp(ctx.region.x + ctx.region.width - (point.x - ctx.region.x), ctx.minCanvasX, ctx.maxCanvasX),
-              y: point.y,
-            }));
-            await ctx.stroke(mirrored, 0.45);
-            ctx.advanceProgress();
-          }
-        }
-      },
-    },
-    cascade: {
-      label: 'Cascade drapery',
-      description: 'Pointer sweeps unfurl silky waterfall ribbons that ripple across the canvas.',
-      estimate(region, options) {
-        const rows = Math.max(4, Math.round((options.density || 0) / 10));
-        return Math.max(1, rows * (options.mirror ? 2 : 1));
-      },
-      async run(ctx) {
-        const rows = Math.max(4, Math.round((ctx.options.density || 0) / 10));
-        const width = Math.max(1, ctx.region.width);
-        const height = Math.max(1, ctx.region.height);
-        const amplitudeBase = Math.max(6, height * 0.08);
-        for (let row = 0; row < rows; row += 1) {
-          ctx.ensureActive();
-          const baseY = ctx.region.y + (height / (rows + 1)) * (row + 1);
-          const waveAmp = amplitudeBase * (1 + row / (rows * 0.9));
-          const steps = Math.max(80, Math.round(width / 4));
-          const path = [];
-          for (let step = 0; step <= steps; step += 1) {
-            const t = step / steps;
-            const x = clamp(ctx.region.x + t * width, ctx.minCanvasX, ctx.maxCanvasX);
-            let y = baseY + Math.sin(t * Math.PI * (1.6 + row * 0.25)) * waveAmp;
-            if (ctx.options.jitter) {
-              y += (ctx.random() - 0.5) * waveAmp * 0.35;
-            }
-            y = clamp(y, ctx.minCanvasY, ctx.maxCanvasY);
-            path.push({ x, y });
-          }
-          await ctx.stroke(path, 0.52);
-          ctx.advanceProgress();
-          if (ctx.options.mirror) {
-            const mirrored = path.map((point, index) => ({
-              x: clamp(ctx.region.x + ctx.region.width - (point.x - ctx.region.x), ctx.minCanvasX, ctx.maxCanvasX),
-              y: clamp(
-                ctx.region.y + ctx.region.height - (point.y - ctx.region.y) + Math.sin(index * 0.08) * waveAmp * 0.12,
-                ctx.minCanvasY,
-                ctx.maxCanvasY
-              ),
-            }));
-            await ctx.stroke(mirrored, 0.48);
-            ctx.advanceProgress();
-          }
-        }
-      },
-    },
-  };
-
-  function updateFunDescription() {
-    if (!ui.funDescription || !ui.funModeSelect) {
-      return;
-    }
-    const effect = funFeatures[ui.funModeSelect.value];
-    if (effect) {
-      ui.funDescription.textContent = effect.description;
-    } else {
-      ui.funDescription.textContent = 'Select an effect to view its details.';
-    }
-  }
-
-  function resolveFunRegion(canvas) {
-    const width = canvas?.width || 0;
-    const height = canvas?.height || 0;
-    if (!state.selection) {
-      return { x: 0, y: 0, width, height };
-    }
-    const sel = state.selection;
-    const x = clamp(Math.round(sel.normX * width), 0, width);
-    const y = clamp(Math.round(sel.normY * height), 0, height);
-    const w = Math.max(1, Math.round(sel.normWidth * width));
-    const h = Math.max(1, Math.round(sel.normHeight * height));
-    const maxWidth = Math.max(1, width - x);
-    const maxHeight = Math.max(1, height - y);
-    return {
-      x,
-      y,
-      width: clamp(w, 1, maxWidth),
-      height: clamp(h, 1, maxHeight),
-    };
-  }
-
-  function canvasPointToClient(canvas, x, y) {
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = rect.width / canvas.width || 1;
-    const scaleY = rect.height / canvas.height || 1;
-    return {
-      clientX: rect.left + x * scaleX,
-      clientY: rect.top + y * scaleY,
-    };
-  }
-
-  function dispatchCanvasPointer(canvas, type, pointerId, x, y, options = {}) {
-    const coords = canvasPointToClient(canvas, x, y);
-    const eventInit = {
-      pointerId,
-      pointerType: 'pen',
-      clientX: coords.clientX,
-      clientY: coords.clientY,
-      buttons: type === 'pointerup' ? 0 : 1,
-      pressure: type === 'pointerup' ? 0 : options.pressure ?? 0.6,
-      tiltX: options.tiltX ?? 0,
-      tiltY: options.tiltY ?? 0,
-      bubbles: true,
-      cancelable: true,
-    };
-    const event = new PointerEvent(type, eventInit);
-    canvas.dispatchEvent(event);
-  }
-
-  async function performPointerStroke(canvas, pointerId, points, stepDelay, pressure = 0.6) {
-    if (!points.length) {
-      return;
-    }
-    ensureFunNotAborted();
-    const first = points[0];
-    dispatchCanvasPointer(canvas, 'pointerdown', pointerId, first.x, first.y, { pressure });
     try {
-      if (canvas.setPointerCapture) {
-        try {
-          canvas.setPointerCapture(pointerId);
-        } catch (err) {
-          // ignore capture failures
-        }
-      }
-      for (let i = 1; i < points.length; i += 1) {
-        ensureFunNotAborted();
-        const point = points[i];
-        dispatchCanvasPointer(canvas, 'pointermove', pointerId, point.x, point.y, { pressure });
-        await wait(stepDelay);
-      }
-    } finally {
-      const last = points[points.length - 1];
-      dispatchCanvasPointer(canvas, 'pointerup', pointerId, last.x, last.y, { pressure: 0 });
-      if (canvas.releasePointerCapture) {
-        try {
-          canvas.releasePointerCapture(pointerId);
-        } catch (err) {
-          // ignore release failures
-        }
-      }
-    }
-  }
-
-  function computeFunTiming(tempo) {
-    const raw = Number(tempo);
-    const clampedTempo = clamp(Number.isFinite(raw) ? raw : 60, 10, 160);
-    const stepDelay = Math.max(2, Math.round(22 - clampedTempo / 6));
-    const strokeGap = Math.max(6, Math.round(stepDelay * 2));
-    return { stepDelay, strokeGap };
-  }
-
-  function createFunContext(canvas, region, options, stepDelay, strokeGap, onProgress) {
-    const pointerId = funState.pointerId;
-    const minCanvasX = Math.max(0, Math.min(canvas.width, region.x));
-    const maxCanvasX = Math.max(minCanvasX + 1, Math.min(canvas.width, region.x + region.width));
-    const minCanvasY = Math.max(0, Math.min(canvas.height, region.y));
-    const maxCanvasY = Math.max(minCanvasY + 1, Math.min(canvas.height, region.y + region.height));
-    let completed = 0;
-    const clampPoint = (point) => ({
-      x: clamp(point.x, minCanvasX, maxCanvasX),
-      y: clamp(point.y, minCanvasY, maxCanvasY),
-    });
-    return {
-      canvas,
-      region,
-      options,
-      pointerId,
-      stepDelay,
-      strokeGap,
-      minCanvasX,
-      maxCanvasX,
-      minCanvasY,
-      maxCanvasY,
-      random: Math.random,
-      ensureActive: ensureFunNotAborted,
-      async stroke(points, pressure = 0.6) {
-        ensureFunNotAborted();
-        if (!points || points.length < 2) {
-          return;
-        }
-        const safePoints = points.map(clampPoint);
-        await performPointerStroke(canvas, pointerId, safePoints, stepDelay, pressure);
-        await wait(strokeGap);
-      },
-      advanceProgress(increment = 1) {
-        completed += increment;
-        if (typeof onProgress === 'function') {
-          onProgress(completed);
-        }
-      },
-      setProgress(value) {
-        completed = value;
-        if (typeof onProgress === 'function') {
-          onProgress(completed);
-        }
-      },
-    };
-  }
-
-  async function startFunEffect() {
-    if (!ui.funModeSelect || !ui.funRunButton) {
-      return;
-    }
-    if (state.running) {
-      updateFunStatus('Stop the image painter before launching a fun effect.');
-      return;
-    }
-    if (funState.running) {
-      updateFunStatus('A fun effect is already running.');
-      return;
-    }
-    const effectKey = ui.funModeSelect.value;
-    const effect = funFeatures[effectKey];
-    if (!effect) {
-      updateFunStatus('Select a fun effect to begin.');
-      return;
-    }
-    const canvas = selectLargestCanvas();
-    if (!canvas) {
-      updateFunStatus('Canvas not found — join a Drawaria room first.');
-      return;
-    }
-    if (!canvas.width || !canvas.height) {
-      updateFunStatus('Canvas is not ready yet — wait for it to load.');
-      return;
-    }
-    const region = resolveFunRegion(canvas);
-    if (!region.width || !region.height) {
-      updateFunStatus('Selection is too small for the fun lab.');
-      return;
-    }
-    const options = {
-      density: funSettings.density,
-      tempo: funSettings.tempo,
-      mirror: funSettings.mirror,
-      jitter: funSettings.jitter,
-    };
-    const { stepDelay, strokeGap } = computeFunTiming(options.tempo);
-    const total = Math.max(1, effect.estimate(region, options));
-    funState.running = true;
-    funState.abortRequested = false;
-    funState.activeFeature = effectKey;
-    ui.funRunButton.disabled = true;
-    if (ui.funStopButton) {
-      ui.funStopButton.disabled = false;
-    }
-    updateFunProgress(0);
-    updateFunStatus(`Running ${effect.label}…`);
-    let aborted = false;
-    try {
-      const context = createFunContext(canvas, region, options, stepDelay, strokeGap, (completed) => {
-        const percent = (completed / total) * 100;
-        updateFunProgress(percent);
-      });
-      await effect.run(context);
-      aborted = funState.abortRequested;
-      if (aborted) {
-        updateFunStatus('Fun effect aborted.');
-      } else {
-        updateFunProgress(100);
-        updateFunStatus(`${effect.label} complete!`);
+      if (!ws.url || !/drawaria\.online/.test(ws.url)) {
+        return;
       }
     } catch (err) {
-      if (err instanceof FunAbort) {
-        updateFunStatus('Fun effect aborted.');
-      } else {
-        console.error('drawaria image autodraw fun lab error', err);
-        updateFunStatus(`Fun effect error: ${err.message || err}`);
-      }
-    } finally {
-      funState.running = false;
-      funState.activeFeature = null;
-      funState.abortRequested = false;
-      if (ui.funRunButton) {
-        ui.funRunButton.disabled = false;
-      }
-      if (ui.funStopButton) {
-        ui.funStopButton.disabled = true;
-      }
-    }
-  }
-
-  function stopFunEffect() {
-    if (!funState.running) {
-      updateFunStatus('No fun effect is currently running.');
       return;
     }
-    funState.abortRequested = true;
-    updateFunStatus('Stopping fun effect…');
-  }
-
-  function updateFunProgress(percent) {
-    if (!ui.funProgressBar) {
+    if (globalNetwork.meta.has(ws)) {
       return;
     }
-    const numeric = Number(percent);
-    const clampedPercent = clamp(Number.isFinite(numeric) ? numeric : 0, 0, 100);
-    ui.funProgressBar.style.width = `${clampedPercent}%`;
-  }
 
-  function updateFunStatus(message) {
-    if (!ui.funStatus) {
-      return;
-    }
-    ui.funStatus.textContent = message;
-  }
+    const info = { roomId: null, players: 0 };
+    globalNetwork.sockets.add(ws);
+    globalNetwork.meta.set(ws, info);
 
-  function updateSelectionUI() {
-    if (!ui.selectionDetails) {
-      return;
-    }
-    if (state.selection) {
-      const sel = state.selection;
-      const boardW = state.metrics.boardWidth || sel.boardWidth || 0;
-      const boardH = state.metrics.boardHeight || sel.boardHeight || 0;
-      const widthPx = Math.round(boardW * sel.normWidth);
-      const heightPx = Math.round(boardH * sel.normHeight);
-      const startX = Math.round(boardW * sel.normX);
-      const startY = Math.round(boardH * sel.normY);
-      ui.selectionDetails.textContent = `Region ${widthPx}×${heightPx}px @ (${startX}, ${startY})`;
-      ui.selectionDetails.dataset.state = 'active';
-      if (ui.clearRegionButton) {
-        ui.clearRegionButton.disabled = false;
-      }
-    } else {
-      ui.selectionDetails.textContent = 'Full canvas coverage';
-      ui.selectionDetails.dataset.state = 'inactive';
-      if (ui.clearRegionButton) {
-        ui.clearRegionButton.disabled = true;
-      }
-    }
-  }
-
-  function updateMetricsUI() {
-    if (!ui.metricResolution) {
-      return;
-    }
-    if (state.pixelWidth && state.pixelHeight) {
-      ui.metricResolution.textContent = `${state.pixelWidth}×${state.pixelHeight}`;
-    } else {
-      ui.metricResolution.textContent = '—';
-    }
-    const scale = state.metrics.scaleFactor || 1;
-    const targetWidth = state.metrics.targetWidth || state.metrics.boardWidth;
-    const targetHeight = state.metrics.targetHeight || state.metrics.boardHeight;
-    if (scale && targetWidth && targetHeight) {
-      const label = state.metrics.selectionActive ? `selection ${Math.round(targetWidth)}×${Math.round(targetHeight)}` : `${Math.round(targetWidth)}×${Math.round(targetHeight)}`;
-      ui.metricScale.textContent = `Scaled ×${scale.toFixed(2)} into ${label}`;
-    } else {
-      ui.metricScale.textContent = 'Fit-to-canvas ready';
-    }
-    ui.metricPalette.textContent = formatNumber(state.metrics.paletteCount || state.palette.length || 0);
-    const orderLabels = {
-      'dark-first': 'Dark → Light',
-      'light-first': 'Light → Dark',
-      coverage: 'Coverage priority',
-    };
-    ui.metricPaletteNote.textContent = orderLabels[state.paletteSortMode] || state.paletteSortMode;
-    ui.metricStrokes.textContent = formatNumber(state.metrics.estimatedStrokes || 0);
-    ui.metricLanes.textContent = `Lane fan ×${state.metrics.laneCount || 1}`;
-    ui.metricEta.textContent = formatDuration(state.metrics.estimatedDurationMs || 0);
-    ui.metricDelay.textContent = `8ms stroke delay • ${formatNumber(state.metrics.estimatedStrokes || 0)} strokes`;
-  }
-
-  function getSettingsSignature() {
-    const s = state.settings;
-    return [
-      state.paletteSortMode,
-      s.smoothnessPercent,
-      s.laneFanMultiplier,
-      s.coverageBoost,
-      s.detailMode,
-      s.lowResEnhancer,
-      s.edgeDetail,
-      s.microDetail,
-      s.ditherStrength,
-      s.spectralBoost,
-      s.highlightGlaze,
-      s.textureWeave,
-      s.gradientEcho,
-    ].join('|');
-  }
-
-  function getSelectionSignature() {
-    if (!state.selection) {
-      return 'full';
-    }
-    const sel = state.selection;
-    const toFixed = (value, fallback) => {
-      const num = Number(value);
-      if (!Number.isFinite(num)) {
-        return fallback;
-      }
-      return num.toFixed(4);
-    };
-    return [
-      toFixed(sel.normX, '0.0000'),
-      toFixed(sel.normY, '0.0000'),
-      toFixed(sel.normWidth, '1.0000'),
-      toFixed(sel.normHeight, '1.0000'),
-    ].join('|');
-  }
-
-  async function scheduleMetricsUpdate() {
-    if (metricsUpdateScheduled || !state.prepared || state.running) {
-      return;
-    }
-    metricsUpdateScheduled = true;
-    try {
-      await wait(80);
-      const canvas = selectLargestCanvas();
-      if (!canvas) {
-        updateMetricsUI();
+    const handleMessage = (event) => {
+      if (!event || typeof event.data !== 'string') {
         return;
       }
-      const commands = buildPixelCommands(canvas.width, canvas.height);
-      if (!commands.length) {
-        updateMetricsUI();
-      }
-    } finally {
-      metricsUpdateScheduled = false;
-    }
-  }
-
-  async function prepareFromFile(file) {
-    if (!file) {
-      throw new Error('Select an image file to begin.');
-    }
-
-    ui.previewLoading.classList.add('visible');
-    ui.progressBar.style.width = '0%';
-    ui.progressLabel.textContent = '0%';
-    ui.status.textContent = 'Loading image…';
-
-    try {
-      await wait(10);
-
-      const maxDimension = Number(ui.dimensionInput.value) || 500;
-      const image = await loadImageFromFile(file);
-      const imageData = resizeImageToFit(image, maxDimension);
-      const { width, height } = imageData;
-      state.sourceImageData = imageData;
-      state.pixelWidth = width;
-      state.pixelHeight = height;
-      previewImage(image, width, height);
-
-      ui.status.textContent = `Quantising colours (≤${MAX_COLOUR_CAPACITY})…`;
-      await wait(10);
-      const { palette, assignments } = quantizeToPalette(
-        imageData,
-        width,
-        height,
-        MAX_COLOUR_CAPACITY
-      );
-
-      state.palette = palette;
-      state.assignments = assignments;
-      state.prepared = true;
-      state.previewDataUrl = hiddenCanvas.toDataURL('image/png');
-      state.commandCache = null;
-      const usage = new Float64Array(palette.length);
-      for (let i = 0; i < assignments.length; i++) {
-        const paletteIndex = assignments[i];
-        if (paletteIndex !== 0xffff && usage[paletteIndex] !== undefined) {
-          usage[paletteIndex] += 1;
+      const message = event.data;
+      try {
+        if (message.startsWith('42')) {
+          const payload = JSON.parse(message.slice(2));
+          const tag = payload?.[0];
+          if (tag === 'bc_uc_freedrawsession_changedroom') {
+            info.players = Array.isArray(payload?.[3]) ? payload[3].length : info.players;
+            info.roomId = payload?.[4] || info.roomId;
+          } else if (tag === 'mc_roomplayerschange') {
+            info.players = Array.isArray(payload?.[3]) ? payload[3].length : info.players;
+          }
+        } else if (message.startsWith('430')) {
+          const configs = JSON.parse(message.slice(3))[0];
+          if (configs) {
+            info.roomId = configs.roomid ?? info.roomId;
+            info.players = Array.isArray(configs.players) ? configs.players.length : info.players;
+          }
         }
+      } catch (err) {
+        console.debug('OmniDraw socket parse issue', err);
       }
-      state.paletteUsage = Array.from(usage);
-      state.metrics.pixelCount = width * height;
-      state.metrics.paletteCount = palette.length;
-      state.metrics.estimatedStrokes = 0;
-      state.metrics.estimatedDurationMs = 0;
-      state.metrics.scaleFactor = 0;
-      state.metrics.boardWidth = 0;
-      state.metrics.boardHeight = 0;
-      state.metrics.targetWidth = 0;
-      state.metrics.targetHeight = 0;
-      state.metrics.selectionActive = false;
-      renderPaletteSwatches(palette, state.paletteUsage);
-      renderPaletteInsights(palette, state.paletteUsage);
-      applyPanelThemeFromPalette(palette, state.paletteUsage);
-      updateModeLabel();
-      updateMetricsUI();
-      ui.status.textContent = `Ready: ${width}×${height}px, ${palette.length} colours.`;
-      await scheduleMetricsUpdate();
-    } finally {
-      ui.previewLoading.classList.remove('visible');
+      updateConnectionStatus();
+    };
+
+    const handleOpen = () => {
+      updateConnectionStatus();
+    };
+
+    const handleClose = () => {
+      ws.removeEventListener('message', handleMessage);
+      ws.removeEventListener('close', handleClose);
+      ws.removeEventListener('open', handleOpen);
+      globalNetwork.meta.delete(ws);
+      globalNetwork.sockets.delete(ws);
+      updateConnectionStatus();
+    };
+
+    ws.addEventListener('message', handleMessage);
+    ws.addEventListener('close', handleClose);
+    ws.addEventListener('open', handleOpen);
+    if (ws.readyState === WebSocket.OPEN) {
+      updateConnectionStatus();
     }
   }
 
-  async function waitForSocket(timeout = 5000) {
-    const start = performance.now();
-    while (performance.now() - start < timeout) {
-      const socket = wsBridge.getSocket();
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        return socket;
+  function getActiveSocket() {
+    const botSocket = state.bot?.player?.conn?.socket;
+    if (botSocket && (botSocket.readyState === WebSocket.OPEN || botSocket.readyState === WebSocket.CONNECTING)) {
+      return botSocket;
+    }
+    for (const ws of globalNetwork.sockets) {
+      if (ws.readyState === WebSocket.OPEN) {
+        return ws;
       }
-      await wait(120);
+    }
+    for (const ws of globalNetwork.sockets) {
+      if (ws.readyState === WebSocket.CONNECTING) {
+        return ws;
+      }
     }
     return null;
   }
 
-
-
-  function buildPixelCommands(canvasWidth, canvasHeight) {
-    const assignments = state.assignments;
-    const palette = state.palette;
-    const width = state.pixelWidth;
-    const height = state.pixelHeight;
-    const imageData = state.sourceImageData;
-
-    if (
-      !assignments ||
-      !palette.length ||
-      !width ||
-      !height ||
-      !canvasWidth ||
-      !canvasHeight
-    ) {
-      return [];
+  async function waitForSocketReady(socket, timeout = 4000) {
+    if (!socket) return false;
+    if (socket.readyState === WebSocket.OPEN) {
+      return true;
     }
-
-    const boardWidth = canvasWidth;
-    const boardHeight = canvasHeight;
-    let targetX = 0;
-    let targetY = 0;
-    let targetWidth = boardWidth;
-    let targetHeight = boardHeight;
-    let selectionActive = false;
-
-    if (state.selection) {
-      const sel = state.selection;
-      const normWidth = clamp(sel.normWidth ?? 1, 1 / Math.max(1, boardWidth), 1);
-      const normHeight = clamp(sel.normHeight ?? 1, 1 / Math.max(1, boardHeight), 1);
-      const normX = clamp(sel.normX ?? 0, 0, 1 - normWidth);
-      const normY = clamp(sel.normY ?? 0, 0, 1 - normHeight);
-      targetWidth = Math.max(1, normWidth * boardWidth);
-      targetHeight = Math.max(1, normHeight * boardHeight);
-      targetX = clamp(normX * boardWidth, 0, Math.max(0, boardWidth - targetWidth));
-      targetY = clamp(normY * boardHeight, 0, Math.max(0, boardHeight - targetHeight));
-      selectionActive = true;
-      sel.boardWidth = boardWidth;
-      sel.boardHeight = boardHeight;
+    if (socket.readyState !== WebSocket.CONNECTING) {
+      return false;
     }
-
-    const scaleX = targetWidth / width;
-    const scaleY = targetHeight / height;
-    const scale = Math.min(scaleX, scaleY);
-    const drawWidth = width * scale;
-    const drawHeight = height * scale;
-    const offsetX = clamp(targetX + (targetWidth - drawWidth) / 2, 0, Math.max(0, boardWidth - drawWidth));
-    const offsetY = clamp(targetY + (targetHeight - drawHeight) / 2, 0, Math.max(0, boardHeight - drawHeight));
-
-    state.metrics.scaleFactor = scale;
-    state.metrics.boardWidth = boardWidth;
-    state.metrics.boardHeight = boardHeight;
-    state.metrics.targetWidth = targetWidth;
-    state.metrics.targetHeight = targetHeight;
-    state.metrics.selectionActive = selectionActive;
-
-    const settingsSignature = getSettingsSignature();
-    const selectionSignature = getSelectionSignature();
-    const cacheKey = `${width}x${height}|${boardWidth}x${boardHeight}|${targetWidth.toFixed(2)}x${targetHeight.toFixed(2)}|${settingsSignature}|${selectionSignature}`;
-    if (state.commandCache && state.commandCache.key === cacheKey) {
-      Object.assign(state.metrics, state.commandCache.metrics);
-      updateMetricsUI();
-      updateSelectionUI();
-      return state.commandCache.commands;
-    }
-
-    const colourCommands = Array.from({ length: palette.length }, () => []);
-    const paletteProfiles = palette.map((colour) => computeColourProfile(colour));
-    const colourCoverage = new Float64Array(palette.length);
-    const phaseOrder = {
-      fill: 0,
-      'fill-secondary': 1,
-      detail: 2,
-      'detail-edge': 3,
-      glaze: 4,
-      texture: 5,
-      echo: 6,
-    };
-
-    const alphaData = imageData?.data ?? null;
-    const detailMask = new Uint8Array(width * height);
-    if (alphaData) {
-      const threshold = 4200;
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const idx = y * width + x;
-          const paletteIndex = assignments[idx];
-          if (paletteIndex === 0xffff) {
-            continue;
-          }
-          const offset = idx * 4;
-          const r = alphaData[offset];
-          const g = alphaData[offset + 1];
-          const b = alphaData[offset + 2];
-
-          let maxDiff = 0;
-          if (x > 0) {
-            const left = offset - 4;
-            maxDiff = Math.max(
-              maxDiff,
-              perceptualColourDistance(r, g, b, alphaData[left], alphaData[left + 1], alphaData[left + 2])
-            );
-          }
-          if (x + 1 < width) {
-            const right = offset + 4;
-            maxDiff = Math.max(
-              maxDiff,
-              perceptualColourDistance(r, g, b, alphaData[right], alphaData[right + 1], alphaData[right + 2])
-            );
-          }
-          if (y > 0) {
-            const up = offset - width * 4;
-            maxDiff = Math.max(
-              maxDiff,
-              perceptualColourDistance(r, g, b, alphaData[up], alphaData[up + 1], alphaData[up + 2])
-            );
-          }
-          if (y + 1 < height) {
-            const down = offset + width * 4;
-            maxDiff = Math.max(
-              maxDiff,
-              perceptualColourDistance(r, g, b, alphaData[down], alphaData[down + 1], alphaData[down + 2])
-            );
-          }
-
-          if (maxDiff > threshold) {
-            detailMask[idx] = 1;
-          }
-        }
-      }
-    }
-
-    const edgeMask = new Uint8Array(width * height);
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const idx = y * width + x;
-        const paletteIndex = assignments[idx];
-        if (paletteIndex === 0xffff) {
-          continue;
-        }
-        let isEdge = false;
-        if (x > 0) {
-          const neighbour = assignments[idx - 1];
-          if (neighbour !== paletteIndex && neighbour !== 0xffff) {
-            isEdge = true;
-          }
-        }
-        if (x + 1 < width) {
-          const neighbour = assignments[idx + 1];
-          if (neighbour !== paletteIndex && neighbour !== 0xffff) {
-            isEdge = true;
-          }
-        }
-        if (y > 0) {
-          const neighbour = assignments[idx - width];
-          if (neighbour !== paletteIndex && neighbour !== 0xffff) {
-            isEdge = true;
-          }
-        }
-        if (y + 1 < height) {
-          const neighbour = assignments[idx + width];
-          if (neighbour !== paletteIndex && neighbour !== 0xffff) {
-            isEdge = true;
-          }
-        }
-        if (isEdge) {
-          edgeMask[idx] = 1;
-        }
-      }
-    }
-
-    const pushStroke = (paletteIndex, x1, y1, x2, y2, orientation, phase = 'fill') => {
-      if (paletteIndex < 0 || paletteIndex >= colourCommands.length) {
-        return;
-      }
-
-      const minX = Math.min(x1, x2);
-      const maxX = Math.max(x1, x2);
-      const minY = Math.min(y1, y2);
-      const maxY = Math.max(y1, y2);
-
-      if (maxX <= 0 || maxY <= 0 || minX >= boardWidth || minY >= boardHeight) {
-        return;
-      }
-
-      let nx1 = clamp(x1 / boardWidth, 0, 1);
-      let ny1 = clamp(y1 / boardHeight, 0, 1);
-      let nx2 = clamp(x2 / boardWidth, 0, 1);
-      let ny2 = clamp(y2 / boardHeight, 0, 1);
-
-      const epsilonX = boardWidth > 0 ? 0.75 / boardWidth : 0;
-      const epsilonY = boardHeight > 0 ? 0.75 / boardHeight : 0;
-
-      if (Math.abs(nx1 - nx2) < 1e-5) {
-        nx2 = clamp(nx2 + (nx2 >= nx1 ? epsilonX : -epsilonX), 0, 1);
-      }
-      if (Math.abs(ny1 - ny2) < 1e-5) {
-        ny2 = clamp(ny2 + (ny2 >= ny1 ? epsilonY : -epsilonY), 0, 1);
-      }
-
-      colourCommands[paletteIndex].push({
-        nx1: nx1.toFixed(6),
-        ny1: ny1.toFixed(6),
-        nx2: nx2.toFixed(6),
-        ny2: ny2.toFixed(6),
-        orientation,
-        phase,
-      });
-    };
-
-    const smoothingPercent = state.settings.smoothnessPercent ?? 40;
-    const laneMultiplier = state.settings.laneFanMultiplier ?? 100;
-    const coverageBoost = (state.settings.coverageBoost ?? 100) / 100;
-    const detailMode = state.settings.detailMode || 'balanced';
-    const allowLowRes = state.settings.lowResEnhancer !== false;
-    const allowEdgeDetail = state.settings.edgeDetail !== false;
-    const allowMicroDetail = state.settings.microDetail !== false;
-    const spectralBoost = Math.max(10, state.settings.spectralBoost ?? 120) / 100;
-    const highlightGlaze = state.settings.highlightGlaze !== false;
-    const weaveEnabled = state.settings.textureWeave === true;
-    const gradientEcho = state.settings.gradientEcho !== false;
-
-    const baseLaneSpacing = (() => {
-      if (scale >= 24) {
-        return 0.95;
-      }
-      if (scale >= 12) {
-        return 0.88;
-      }
-      if (scale >= 6) {
-        return 0.78;
-      }
-      return 0.64;
-    })();
-
-    const smoothingFactor = 1 + smoothingPercent / 100;
-    const laneDensityFactor = Math.max(10, laneMultiplier) / 100;
-    const laneSpacing = (baseLaneSpacing / smoothingFactor) / laneDensityFactor;
-
-    const coveragePad = Math.min(
-      scale * 0.45 * coverageBoost,
-      Math.max(0.9, baseLaneSpacing * 1.5 * coverageBoost)
-    );
-    const detailMultiplier = detailMode === 'max' ? 1.35 : detailMode === 'minimal' ? 0.75 : 1;
-    const detailLaneOffset = Math.min(
-      scale * 0.28 * detailMultiplier,
-      Math.max(0.45, baseLaneSpacing * 1.4 * detailMultiplier)
-    );
-    const microThreshold = detailMode === 'max' ? 4 : detailMode === 'minimal' ? 1 : 2;
-
-    let laneCount = Math.max(1, Math.ceil((scale + laneSpacing * 0.5) / laneSpacing));
-    if (allowLowRes) {
-      if (scale < 1.5) {
-        laneCount = Math.max(laneCount, 5);
-      } else if (scale < 2.5) {
-        laneCount = Math.max(laneCount, 4);
-      } else if (scale < 4) {
-        laneCount = Math.max(laneCount, 3);
-      }
-    }
-
-    const laneOffsets = [];
-    if (laneCount === 1) {
-      laneOffsets.push(0);
-    } else {
-      const totalSpan = (laneCount - 1) * laneSpacing;
-      const startOffset = -totalSpan / 2;
-      for (let laneIndex = 0; laneIndex < laneCount; laneIndex++) {
-        laneOffsets.push(startOffset + laneIndex * laneSpacing);
-      }
-    }
-    state.metrics.laneCount = laneOffsets.length;
-
-    for (let y = 0; y < height; y++) {
-      let x = 0;
-      while (x < width) {
-        const idx = y * width + x;
-        const paletteIndex = assignments[idx];
-        if (paletteIndex === 0xffff) {
-          x += 1;
-          continue;
-        }
-
-        let runStart = x;
-        let runEnd = x;
-        let runDetail = false;
-        let runEdge = false;
-        while (runEnd < width && assignments[y * width + runEnd] === paletteIndex) {
-          const runIdx = y * width + runEnd;
-          if (detailMask[runIdx]) {
-            runDetail = true;
-          }
-          if (edgeMask[runIdx]) {
-            runEdge = true;
-          }
-          runEnd += 1;
-        }
-
-        const runLength = runEnd - runStart;
-        const startX = offsetX + runStart * scale - coveragePad;
-        const endX = offsetX + runEnd * scale + coveragePad;
-        const centerY = offsetY + (y + 0.5) * scale;
-        const profile = paletteProfiles[paletteIndex] || null;
-
-        colourCoverage[paletteIndex] += runLength * laneOffsets.length;
-
-        laneOffsets.forEach((laneOffset, laneIndex) => {
-          pushStroke(
-            paletteIndex,
-            startX,
-            centerY + laneOffset,
-            endX,
-            centerY + laneOffset,
-            laneIndex === 0 ? 'run-primary' : 'run-lane',
-            laneIndex === 0 ? 'fill' : 'fill-secondary'
-          );
-        });
-
-        if (allowMicroDetail && runLength <= microThreshold) {
-          const centerX = offsetX + (runStart + runLength / 2) * scale;
-          const microHalf = Math.max(scale * 0.55, 0.85);
-          pushStroke(
-            paletteIndex,
-            centerX - microHalf,
-            centerY,
-            centerX + microHalf,
-            centerY,
-            'micro-detail',
-            'detail'
-          );
-        } else if ((runDetail && detailMode !== 'minimal') || (runEdge && allowEdgeDetail)) {
-          pushStroke(
-            paletteIndex,
-            startX,
-            centerY + detailLaneOffset,
-            endX,
-            centerY + detailLaneOffset,
-            'detail-offset',
-            'detail'
-          );
-        }
-
-        if (runEdge && allowEdgeDetail) {
-          const centerX = offsetX + (runStart + runLength / 2) * scale;
-          const edgeHalf = Math.max(scale * 0.6, 0.9);
-          pushStroke(
-            paletteIndex,
-            centerX - edgeHalf,
-            centerY,
-            centerX + edgeHalf,
-            centerY,
-            'edge-center',
-            'detail-edge'
-          );
-        }
-
-        let extraCoverage = 0;
-        if (highlightGlaze && profile && profile.value > 0.62) {
-          const glazeOffset = Math.max(scale * 0.35, detailLaneOffset * 0.45);
-          pushStroke(
-            paletteIndex,
-            startX,
-            centerY - glazeOffset,
-            endX,
-            centerY - glazeOffset,
-            'glaze-upper',
-            'glaze'
-          );
-          pushStroke(
-            paletteIndex,
-            startX,
-            centerY + glazeOffset,
-            endX,
-            centerY + glazeOffset,
-            'glaze-lower',
-            'glaze'
-          );
-          extraCoverage += runLength * spectralBoost * 0.65;
-        }
-
-        if (gradientEcho && (runDetail || runEdge)) {
-          const echoOffset = Math.max(scale * 0.42, detailLaneOffset * 0.6);
-          pushStroke(
-            paletteIndex,
-            startX,
-            centerY - echoOffset,
-            endX,
-            centerY - echoOffset,
-            'echo-upper',
-            'echo'
-          );
-          pushStroke(
-            paletteIndex,
-            startX,
-            centerY + echoOffset,
-            endX,
-            centerY + echoOffset,
-            'echo-lower',
-            'echo'
-          );
-          extraCoverage += runLength * 0.55;
-        }
-
-        if (weaveEnabled && profile && profile.saturation > 0.4) {
-          const weaveStep = Math.max(1, Math.round(4 / Math.max(0.5, spectralBoost)));
-          const weaveSpan = Math.max(scale * 0.6, 0.9);
-          const weaveTail = Math.max(scale * 0.3, 0.5);
-          let weaveCount = 0;
-          for (let px = runStart, alt = 0; px < runEnd; px += weaveStep, alt += 1) {
-            const centerX = offsetX + (px + 0.5) * scale;
-            const direction = alt % 2 === 0 ? 1 : -1;
-            pushStroke(
-              paletteIndex,
-              centerX - weaveSpan,
-              centerY - weaveTail * direction,
-              centerX + weaveSpan,
-              centerY + weaveTail * direction,
-              'texture-weave',
-              'texture'
-            );
-            weaveCount += 1;
-          }
-          if (weaveCount) {
-            extraCoverage += runLength * 0.25 * spectralBoost + weaveCount * 0.6;
-          }
-        }
-
-        if (extraCoverage > 0) {
-          colourCoverage[paletteIndex] += extraCoverage;
-        }
-
-        x = runEnd;
-      }
-    }
-
-    const paletteEntries = palette.map((colour, index) => ({
-      index,
-      coverage: colourCoverage[index],
-      luminance: 0.2126 * colour.r + 0.7152 * colour.g + 0.0722 * colour.b,
-    }));
-
-    const sortMode = state.paletteSortMode || 'dark-first';
-    paletteEntries.sort((a, b) => {
-      if (sortMode === 'light-first') {
-        if (b.luminance !== a.luminance) {
-          return b.luminance - a.luminance;
-        }
-        return b.coverage - a.coverage;
-      }
-      if (sortMode === 'coverage') {
-        if (b.coverage !== a.coverage) {
-          return b.coverage - a.coverage;
-        }
-        return a.luminance - b.luminance;
-      }
-      if (a.luminance !== b.luminance) {
-        return a.luminance - b.luminance;
-      }
-      return b.coverage - a.coverage;
-    });
-
-    const paletteOrder = paletteEntries.map((entry) => entry.index);
-
-    const commands = [];
-    for (const paletteIndex of paletteOrder) {
-      const colour = palette[paletteIndex];
-      const strokes = colourCommands[paletteIndex];
-      strokes.sort((a, b) => (phaseOrder[a.phase] ?? 99) - (phaseOrder[b.phase] ?? 99));
-      for (const stroke of strokes) {
-        const { phase: _phase, ...rest } = stroke;
-        commands.push({
-          color: colour.hex,
-          ...rest,
-          pass: 'forward',
-        });
-      }
-    }
-
-    state.metrics.estimatedStrokes = commands.length;
-    state.metrics.estimatedDurationMs = commands.length * 8;
-    const metricsSnapshot = {
-      pixelCount: state.metrics.pixelCount,
-      paletteCount: palette.length,
-      estimatedStrokes: state.metrics.estimatedStrokes,
-      estimatedDurationMs: state.metrics.estimatedDurationMs,
-      laneCount: state.metrics.laneCount,
-      scaleFactor: scale,
-      boardWidth,
-      boardHeight,
-      targetWidth,
-      targetHeight,
-      selectionActive,
-    };
-    Object.assign(state.metrics, metricsSnapshot);
-    state.commandCache = { key: cacheKey, commands, metrics: metricsSnapshot };
-    updateMetricsUI();
-    updateSelectionUI();
-    renderPaletteInsights(palette, state.paletteUsage);
-
-    return commands;
-  }
-
-  async function streamCommands(commands, socket, delayMs) {
-    const total = commands.length;
-    let completed = 0;
-    ui.progressBar.style.width = '0%';
-
-    for (const command of commands) {
-      ensureNotAborted();
-      try {
-        socket.send(
-          `42["drawcmd",0,[${command.nx1},${command.ny1},${command.nx2},${command.ny2},false,-1,"${command.color}",0,0,{}]]`
-        );
-      } catch (err) {
-        console.warn('drawaria image autodraw: socket send failed', err);
-      }
-      completed += 1;
-      if (completed % 50 === 0 || completed === total) {
-        const progress = (completed / total) * 100;
-        ui.progressBar.style.width = `${progress}%`;
-        ui.progressLabel.textContent = `${progress.toFixed(1)}%`;
-        ui.status.textContent = `Drawing pixels… ${completed}/${total}`;
-      }
-      await wait(delayMs);
-    }
-
-    ui.progressBar.style.width = '100%';
-    ui.progressLabel.textContent = '100%';
-    ui.status.textContent = 'Drawing complete.';
-  }
-
-  async function runDrawing() {
-    if (state.running) {
-      return;
-    }
-    state.running = true;
-    state.abortRequested = false;
-    ui.startButton.disabled = true;
-    ui.stopButton.disabled = false;
-    ui.panel.classList.add('running');
-
-    try {
-      if (!state.prepared) {
-        const file = ui.fileInput.files[0];
-        await prepareFromFile(file);
-      }
-      ensureNotAborted();
-      ui.status.textContent = 'Waiting for websocket…';
-      const socket = await waitForSocket(5000);
-      if (!socket) {
-        throw new Error('Could not detect Drawaria websocket. Join a room and try again.');
-      }
-      const canvas = selectLargestCanvas();
-      if (!canvas) {
-        throw new Error('Canvas not found. Wait for Drawaria to finish loading.');
-      }
-      ensureNotAborted();
-      ui.status.textContent = 'Mapping pixels to strokes…';
-      await wait(10);
-      const commands = buildPixelCommands(canvas.width, canvas.height);
-      if (!commands.length) {
-        throw new Error('No drawable pixels were detected.');
-      }
-      ensureNotAborted();
-      ui.status.textContent = `Streaming ${commands.length} pixels…`;
-      await streamCommands(commands, socket, 8);
-      ensureNotAborted();
-      ui.status.textContent = 'Image rendered successfully!';
-    } catch (err) {
-      if (err instanceof AbortPainting) {
-        ui.status.textContent = 'Drawing aborted.';
-      } else {
-        console.error('drawaria image autodraw: error', err);
-        ui.status.textContent = `Error: ${err.message || err}`;
-      }
-    } finally {
-      state.running = false;
-      state.abortRequested = false;
-      ui.startButton.disabled = false;
-      ui.stopButton.disabled = true;
-      ui.panel.classList.remove('running');
-    }
-  }
-
-  function handleStop() {
-    if (!state.running) {
-      return;
-    }
-    state.abortRequested = true;
-    ui.status.textContent = 'Finishing current stroke…';
-  }
-
-  async function handleStartClick() {
-    if (!ui.fileInput.files.length && !state.prepared) {
-      ui.status.textContent = 'Please choose an image before drawing.';
-      ui.fileInput.classList.add('shake');
-      setTimeout(() => ui.fileInput.classList.remove('shake'), 500);
-      return;
-    }
-    await runDrawing();
-  }
-
-  async function handleGeneratePreview() {
-    const file = ui.fileInput.files[0];
-    try {
-      await prepareFromFile(file);
-      if (state.settings.autoStart && !state.running) {
-        ui.status.textContent = 'Auto start enabled — beginning draw…';
-        await runDrawing();
-      }
-    } catch (err) {
-      console.error('drawaria image autodraw: preview error', err);
-      ui.status.textContent = `Error: ${err.message || err}`;
-      ui.previewLoading.classList.remove('visible');
-    }
-  }
-
-  const handleFileChange = () => {
-    state.prepared = false;
-    state.commandCache = null;
-    if (ui.fileInput.files.length) {
-      handleGeneratePreview();
-    } else {
-      ui.status.textContent = 'Select an image to begin (max 500px).';
-      ui.paletteStrip.innerHTML = '';
-      ui.paletteSummary.textContent = '0 colours';
-      if (ui.paletteSummarySecondary) {
-        ui.paletteSummarySecondary.textContent = '0 colours';
-      }
-      ui.progressBar.style.width = '0%';
-      ui.progressLabel.textContent = '0%';
-      applyPanelThemeFromPalette([], []);
-      renderPaletteInsights([], []);
-      updateMetricsUI();
-    }
-  };
-
-  ui.fileInput.addEventListener('change', handleFileChange);
-  registerCleanup(() => ui.fileInput.removeEventListener('change', handleFileChange));
-
-  const handleDimensionInput = () => {
-    ui.dimensionValue.textContent = `${ui.dimensionInput.value}px`;
-    state.prepared = false;
-    state.commandCache = null;
-    if (ui.fileInput.files.length) {
-      ui.status.textContent = 'Dimension changed — regenerate preview.';
-    }
-  };
-
-  ui.dimensionInput.addEventListener('input', handleDimensionInput);
-  registerCleanup(() => ui.dimensionInput.removeEventListener('input', handleDimensionInput));
-
-  const handlePaletteOrderChange = () => {
-    state.paletteSortMode = ui.paletteOrderSelect.value;
-    state.commandCache = null;
-    if (state.prepared) {
-      const labelMap = {
-        'dark-first': 'Dark → Light',
-        'light-first': 'Light → Dark',
-        coverage: 'Coverage Priority',
+    const waitPromise = new Promise((resolve) => {
+      const handle = () => {
+        socket.removeEventListener('open', handle);
+        resolve(true);
       };
-      ui.status.textContent = `Colour order set to ${labelMap[state.paletteSortMode] || state.paletteSortMode}.`;
-      scheduleMetricsUpdate();
-    }
-  };
-
-  ui.paletteOrderSelect.addEventListener('change', handlePaletteOrderChange);
-  registerCleanup(() => ui.paletteOrderSelect.removeEventListener('change', handlePaletteOrderChange));
-
-  if (ui.selectRegionButton) {
-    const handleSelectRegion = () => beginCanvasSelection();
-    ui.selectRegionButton.addEventListener('click', handleSelectRegion);
-    registerCleanup(() => ui.selectRegionButton.removeEventListener('click', handleSelectRegion));
+      socket.addEventListener('open', handle, { once: true });
+    });
+    const timeoutPromise = delay(timeout).then(() => false);
+    const result = await Promise.race([waitPromise, timeoutPromise]);
+    return result && socket.readyState === WebSocket.OPEN;
   }
 
-  if (ui.clearRegionButton) {
-    const handleClearRegion = () => clearCanvasSelection();
-    ui.clearRegionButton.addEventListener('click', handleClearRegion);
-    registerCleanup(() => ui.clearRegionButton.removeEventListener('click', handleClearRegion));
+  function getSocketInfo(socket) {
+    if (!socket) return null;
+    return globalNetwork.meta.get(socket) || null;
   }
 
-  function bindSlider(input, valueEl, key, suffix = '%', options = {}) {
-    if (!input || !valueEl) {
-      return;
+  function sendDrawCommand(socket, stroke, color, thickness) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error('Socket not ready');
     }
-    if (state.settings[key] != null) {
-      input.value = state.settings[key];
-    }
-    const update = () => {
-      const rawValue = Number(input.value);
-      const value = Number.isFinite(rawValue) ? rawValue : 0;
-      valueEl.textContent = `${value}${suffix}`;
-      state.settings[key] = value;
-      if (options.onChange) {
-        options.onChange(value);
+    const startX = stroke.start.x.toFixed(4);
+    const startY = stroke.start.y.toFixed(4);
+    const endX = stroke.end.x.toFixed(4);
+    const endY = stroke.end.y.toFixed(4);
+    const weight = -Math.max(0.1, thickness);
+    const safeColor = color || '#000000';
+    const payloadBase = `42["drawcmd",0,[${startX},${startY},${endX},${endY},`;
+    const suffix = `,"${safeColor}",0,0,{"2":0,"3":0.5,"4":0.5}]]`;
+    socket.send(`${payloadBase}true,${weight}${suffix}`);
+    socket.send(`${payloadBase}false,${weight}${suffix}`);
+  }
+
+  function normalizeSegmentForBoard(segment, placement, rect) {
+    const toPoint = (x, y) => {
+      const canvasX = placement.originX + (x + 0.5) * placement.scale;
+      const canvasY = placement.originY + (y + 0.5) * placement.scale;
+      const normX = clamp((canvasX - rect.left) / rect.width, 0, 1);
+      const normY = clamp((canvasY - rect.top) / rect.height, 0, 1);
+      if (!Number.isFinite(normX) || !Number.isFinite(normY)) {
+        return null;
       }
-      if (options.requiresReprepare) {
-        state.prepared = false;
-        state.commandCache = null;
-        ui.status.textContent = `${options.label || 'Setting'} changed — regenerate preview.`;
-      } else {
-        state.commandCache = null;
-        if (state.prepared) {
-          scheduleMetricsUpdate();
-        }
-      }
-      updateModeLabel();
+      return { x: normX, y: normY };
     };
-    input.addEventListener('input', update);
-    registerCleanup(() => input.removeEventListener('input', update));
-    update();
-  }
-
-  function bindToggle(button, key, options = {}) {
-    if (!button) {
-      return;
-    }
-    const applyState = (active) => {
-      button.dataset.active = active ? 'true' : 'false';
-      button.setAttribute('aria-pressed', active ? 'true' : 'false');
-      state.settings[key] = active;
-      if (options.onChange) {
-        options.onChange(active);
-      }
-      if (options.requiresReprepare) {
-        state.prepared = false;
-        state.commandCache = null;
-        ui.status.textContent = `${options.label || 'Setting'} changed — regenerate preview.`;
-      } else {
-        state.commandCache = null;
-        if (state.prepared) {
-          scheduleMetricsUpdate();
-        }
-      }
-      updateModeLabel();
-    };
-    const handleClick = () => {
-      const nextState = button.dataset.active !== 'true';
-      applyState(nextState);
-    };
-    button.addEventListener('click', handleClick);
-    registerCleanup(() => button.removeEventListener('click', handleClick));
-    const initial = options.initial !== undefined ? options.initial : state.settings[key] !== false;
-    applyState(initial);
-  }
-
-  function bindFunSlider(input, valueEl, key) {
-    if (!input || !valueEl) {
-      return;
-    }
-    if (funSettings[key] != null) {
-      input.value = funSettings[key];
-    }
-    const update = () => {
-      const rawValue = Number(input.value);
-      const value = Number.isFinite(rawValue) ? rawValue : 0;
-      funSettings[key] = value;
-      valueEl.textContent = `${value}`;
-    };
-    input.addEventListener('input', update);
-    registerCleanup(() => input.removeEventListener('input', update));
-    update();
-  }
-
-  function bindFunToggle(button, key) {
-    if (!button) {
-      return;
-    }
-    const apply = (active) => {
-      const stateValue = !!active;
-      button.dataset.active = stateValue ? 'true' : 'false';
-      button.setAttribute('aria-pressed', stateValue ? 'true' : 'false');
-      funSettings[key] = stateValue;
-    };
-    const handleClick = () => {
-      apply(button.dataset.active !== 'true');
-    };
-    button.addEventListener('click', handleClick);
-    registerCleanup(() => button.removeEventListener('click', handleClick));
-    apply(funSettings[key]);
-  }
-
-  bindSlider(ui.smoothnessInput, ui.smoothnessValue, 'smoothnessPercent');
-  bindSlider(ui.laneDensityInput, ui.laneDensityValue, 'laneFanMultiplier');
-  bindSlider(ui.coverageInput, ui.coverageValue, 'coverageBoost');
-  bindSlider(ui.ditherInput, ui.ditherValue, 'ditherStrength', '%', {
-    requiresReprepare: true,
-    label: 'Dither strength',
-  });
-  bindSlider(ui.spectralInput, ui.spectralValue, 'spectralBoost');
-
-  if (ui.detailModeSelect) {
-    ui.detailModeSelect.value = state.settings.detailMode;
-    const handleDetailModeChange = () => {
-      state.settings.detailMode = ui.detailModeSelect.value;
-      state.commandCache = null;
-      updateModeLabel();
-      if (state.prepared) {
-        scheduleMetricsUpdate();
-      }
-    };
-    ui.detailModeSelect.addEventListener('change', handleDetailModeChange);
-    registerCleanup(() => ui.detailModeSelect.removeEventListener('change', handleDetailModeChange));
-  }
-
-  bindToggle(ui.toggleLowRes, 'lowResEnhancer', { label: 'Low-res enhancer' });
-  bindToggle(ui.toggleEdge, 'edgeDetail', { label: 'Edge emphasis' });
-  bindToggle(ui.toggleMicro, 'microDetail', { label: 'Micro detail' });
-  bindToggle(ui.toggleGlaze, 'highlightGlaze', { label: 'Glow glazing' });
-  bindToggle(ui.toggleWeave, 'textureWeave', { label: 'Texture weave' });
-  bindToggle(ui.toggleEcho, 'gradientEcho', { label: 'Gradient echo' });
-  bindToggle(ui.toggleTheme, 'adaptiveTheme', {
-    label: 'Adaptive theme',
-    onChange(active) {
-      applyPanelThemeFromPalette(active ? state.palette : [], active ? state.paletteUsage : []);
-    },
-  });
-
-  bindFunSlider(ui.funDensityInput, ui.funDensityValue, 'density');
-  bindFunSlider(ui.funTempoInput, ui.funTempoValue, 'tempo');
-  bindFunToggle(ui.funMirrorToggle, 'mirror');
-  bindFunToggle(ui.funJitterToggle, 'jitter');
-
-  if (ui.funModeSelect) {
-    const handleFunModeChange = () => {
-      updateFunDescription();
-      const effect = funFeatures[ui.funModeSelect.value];
-      if (effect) {
-        updateFunStatus(`${effect.label} ready — press play.`);
-      } else {
-        updateFunStatus('Select an effect and press play.');
-      }
-    };
-    ui.funModeSelect.addEventListener('change', handleFunModeChange);
-    registerCleanup(() => ui.funModeSelect.removeEventListener('change', handleFunModeChange));
-    handleFunModeChange();
-  } else {
-    updateFunDescription();
-    updateFunStatus('Select an effect and press play.');
-  }
-
-  if (ui.funRunButton) {
-    const handleFunRun = () => {
-      startFunEffect();
-    };
-    ui.funRunButton.addEventListener('click', handleFunRun);
-    registerCleanup(() => ui.funRunButton.removeEventListener('click', handleFunRun));
-  }
-
-  if (ui.funStopButton) {
-    const handleFunStop = () => {
-      stopFunEffect();
-    };
-    ui.funStopButton.addEventListener('click', handleFunStop);
-    registerCleanup(() => ui.funStopButton.removeEventListener('click', handleFunStop));
-    ui.funStopButton.disabled = true;
-  }
-
-  updateFunProgress(0);
-
-  if (ui.toggleAutoStart) {
-    const setAutoStart = (active) => {
-      ui.toggleAutoStart.dataset.active = active ? 'true' : 'false';
-      ui.toggleAutoStart.setAttribute('aria-pressed', active ? 'true' : 'false');
-      state.settings.autoStart = active;
-    };
-    const handleAutoStart = () => {
-      const next = ui.toggleAutoStart.dataset.active !== 'true';
-      setAutoStart(next);
-      ui.status.textContent = next
-        ? 'Auto start enabled — previews will launch drawing automatically.'
-        : 'Auto start disabled.';
-    };
-    ui.toggleAutoStart.addEventListener('click', handleAutoStart);
-    registerCleanup(() => ui.toggleAutoStart.removeEventListener('click', handleAutoStart));
-    setAutoStart(state.settings.autoStart);
-  }
-
-  ui.previewButton.addEventListener('click', handleGeneratePreview);
-  registerCleanup(() => ui.previewButton.removeEventListener('click', handleGeneratePreview));
-
-  ui.startButton.addEventListener('click', handleStartClick);
-  registerCleanup(() => ui.startButton.removeEventListener('click', handleStartClick));
-
-  ui.stopButton.addEventListener('click', handleStop);
-  registerCleanup(() => ui.stopButton.removeEventListener('click', handleStop));
-
-  ui.closeButton.addEventListener('click', () => {
-    state.abortRequested = true;
-    runCleanup();
-  });
-
-  const socketWatcher = setInterval(() => {
-    const socket = wsBridge.getSocket();
-    let status = 'searching';
-    let label = 'Socket: searching…';
-    if (socket) {
-      if (socket.readyState === WebSocket.OPEN) {
-        status = 'connected';
-        label = 'Socket: live';
-      } else if (socket.readyState === WebSocket.CONNECTING) {
-        status = 'searching';
-        label = 'Socket: connecting…';
-      } else {
-        status = 'offline';
-        label = 'Socket: offline';
-      }
-    }
-    if (ui.socketChip && ui.socketChip.dataset.status !== status) {
-      ui.socketChip.dataset.status = status;
-    }
-    if (ui.socketLabel && ui.socketLabel.textContent !== label) {
-      ui.socketLabel.textContent = label;
-    }
-  }, 600);
-  registerCleanup(() => clearInterval(socketWatcher));
-
-  const handleExportPreview = () => {
-    if (!state.previewDataUrl) {
-      ui.status.textContent = 'Generate a preview before exporting.';
-      return;
-    }
-    const link = document.createElement('a');
-    link.href = state.previewDataUrl;
-    const fileName = `autodraw-${state.pixelWidth || 'image'}x${state.pixelHeight || ''}.png`;
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    ui.status.textContent = 'Preview PNG downloaded.';
-  };
-
-  if (ui.exportPreviewButton) {
-    ui.exportPreviewButton.addEventListener('click', handleExportPreview);
-    registerCleanup(() => ui.exportPreviewButton.removeEventListener('click', handleExportPreview));
-  }
-
-  const handleCopyPalette = async () => {
-    if (!state.palette.length) {
-      ui.status.textContent = 'No palette to copy yet — load an image first.';
-      return;
-    }
-    const paletteText = state.palette.map((colour) => colour.hex).join('\n');
-    try {
-      await navigator.clipboard.writeText(paletteText);
-      ui.status.textContent = 'Palette copied to clipboard.';
-    } catch (err) {
-      try {
-        const textarea = document.createElement('textarea');
-        textarea.value = paletteText;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-        ui.status.textContent = 'Palette copied to clipboard.';
-      } catch (fallbackErr) {
-        console.warn('drawaria image autodraw: clipboard copy failed', err, fallbackErr);
-        ui.status.textContent = 'Clipboard copy failed. Please copy manually from the console.';
-      }
-    }
-  };
-
-  if (ui.copyPaletteButton) {
-    ui.copyPaletteButton.addEventListener('click', handleCopyPalette);
-    registerCleanup(() => ui.copyPaletteButton.removeEventListener('click', handleCopyPalette));
-  }
-
-  applyPanelThemeFromPalette(state.palette, state.paletteUsage);
-  renderPaletteInsights(state.palette, state.paletteUsage);
-  updateModeLabel();
-  updateMetricsUI();
-
-  window[SCRIPT_HANDLE] = {
-    cleanup: runCleanup,
-    state,
-  };
-
-  ui.status.textContent = 'Select an image to begin (max 500px).';
-  updateSelectionUI();
-
-  function selectLargestCanvas() {
-    const canvases = Array.from(document.querySelectorAll('canvas'));
-    if (!canvases.length) {
+    const start = toPoint(segment.x1, segment.y1);
+    const end = toPoint(segment.x2, segment.y2);
+    if (!start || !end) {
       return null;
     }
-    return canvases.reduce((largest, candidate) => {
-      const largestArea = largest.width * largest.height;
-      const candidateArea = candidate.width * candidate.height;
-      return candidateArea > largestArea ? candidate : largest;
-    }, canvases[0]);
+    let adjustedStart = start;
+    let adjustedEnd = end;
+    if (Math.abs(start.x - end.x) < 1e-6 && Math.abs(start.y - end.y) < 1e-6) {
+      const epsilon = 1 / Math.max(1024, rect.width + rect.height);
+      adjustedEnd = {
+        x: clamp(start.x + epsilon, 0, 1),
+        y: clamp(start.y + epsilon, 0, 1),
+      };
+    }
+    return { start: adjustedStart, end: adjustedEnd };
   }
 
-  function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
+  function updateConnectionStatus() {
+    const indicator = state.ui.connectionStatus;
+    if (!indicator) return;
+    const bot = state.bot;
+    const socket = getActiveSocket();
+    const info = getSocketInfo(socket);
+    if (bot && socket && socket.readyState === WebSocket.OPEN && bot.status === 'connected') {
+      const roomLabel = bot.room?.id ? `room ${String(bot.room.id).slice(0, 6)}…` : (info?.roomId ? `room ${String(info.roomId).slice(0, 6)}…` : 'active room');
+      indicator.innerHTML = `<span class="drawaria-omni-dot online"></span>Bot linked to ${roomLabel}`;
+    } else if (bot && bot.status === 'connecting') {
+      indicator.innerHTML = '<span class="drawaria-omni-dot pending"></span>Bot connecting…';
+    } else if (bot && bot.status === 'error') {
+      indicator.innerHTML = `<span class="drawaria-omni-dot offline"></span>${bot.lastError || 'Bot error. See Bot tab.'}`;
+    } else if (socket && socket.readyState === WebSocket.CONNECTING) {
+      indicator.innerHTML = '<span class="drawaria-omni-dot pending"></span>Connecting to room…';
+    } else if (socket && socket.readyState === WebSocket.OPEN) {
+      const roomLabel = info?.roomId ? `room ${String(info.roomId).slice(0, 6)}…` : 'active room';
+      indicator.innerHTML = `<span class="drawaria-omni-dot online"></span>Linked to ${roomLabel}`;
+    } else {
+      indicator.innerHTML = '<span class="drawaria-omni-dot offline"></span>Join a game room with the bot tab.';
+    }
+    updateBotDisplay();
+    updateActionButtons();
   }
 
-  let activeSelectionTeardown = null;
+  function updateBotDisplay() {
+    const statusEl = state.ui.botStatus;
+    if (!statusEl) return;
+    const bot = state.bot;
+    if (!bot) {
+      statusEl.innerHTML = '<div><strong>Status:</strong> Not initialised.</div>';
+      return;
+    }
+    const players = Array.isArray(bot.room?.players) ? bot.room.players.length : (bot.room?.players || 0);
+    const roomId = bot.room?.id ? String(bot.room.id) : '—';
+    let summary = '';
+    switch (bot.status) {
+      case 'connected':
+        summary = `<div><strong>Status:</strong> Connected</div><div><strong>Room:</strong> ${roomId}</div><div><strong>Players seen:</strong> ${players}</div>`;
+        break;
+      case 'connecting':
+        summary = `<div><strong>Status:</strong> Connecting…</div><div><strong>Invite:</strong> ${bot.invite || 'public lobby'}</div>`;
+        break;
+      case 'error':
+        summary = `<div><strong>Status:</strong> Error</div><div><strong>Details:</strong> ${bot.lastError || 'Unknown error'}</div>`;
+        break;
+      default:
+        summary = `<div><strong>Status:</strong> Idle</div><div><strong>Invite:</strong> ${bot.invite || 'public lobby'}</div>`;
+        break;
+    }
+    statusEl.innerHTML = summary;
+  }
 
-  function clearActiveSelectionOverlay() {
-    if (activeSelectionTeardown) {
+  function updateFleetDisplay() {
+    const list = state.ui.fleetList;
+    if (!list) return;
+    if (!state.fleet.length) {
+      list.innerHTML = '<div class="drawaria-omni-note">No scout bots are active. Add invites below to launch them.</div>';
+      return;
+    }
+    list.innerHTML = '';
+    state.fleet.forEach((scout, index) => {
+      const item = document.createElement('div');
+      item.className = 'drawaria-omni-fleet-item';
+      const title = document.createElement('strong');
+      title.textContent = `${scout.name} • ${scout.status}`;
+      const roomLine = document.createElement('div');
+      const roomId = scout.room?.id ? String(scout.room.id) : (scout.invite ? scout.invite : 'public lobby');
+      roomLine.textContent = `Room: ${roomId}`;
+      const playersLine = document.createElement('div');
+      const players = Array.isArray(scout.room?.players) ? scout.room.players.length : (scout.room?.players || 0);
+      playersLine.textContent = `Players seen: ${players}`;
+      const statusLine = document.createElement('div');
+      statusLine.textContent = scout.lastError ? `Last message: ${scout.lastError}` : '';
+      const actions = document.createElement('div');
+      actions.className = 'drawaria-omni-fleet-actions';
+      const reconnectBtn = document.createElement('button');
+      reconnectBtn.type = 'button';
+      reconnectBtn.textContent = 'Reconnect';
+      reconnectBtn.addEventListener('click', () => {
+        scout.room.join(scout.invite || '', { allowRandom: true });
+      });
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.textContent = 'Remove';
+      removeBtn.addEventListener('click', () => {
+        removeScoutBot(scout);
+      });
+      actions.append(reconnectBtn, removeBtn);
+      item.append(title, roomLine, playersLine);
+      if (statusLine.textContent) {
+        item.append(statusLine);
+      }
+      item.append(actions);
+      list.appendChild(item);
+    });
+  }
+
+  function createScoutBot(invite, name) {
+    const label = name || `Scout ${state.fleet.length + 1}`;
+    const scout = createBotLogic({
+      name: label,
+      invite: invite || '',
+      primary: false,
+      allowRandom: true,
+      onStatusChange: () => updateFleetDisplay(),
+    });
+    scout.isScout = true;
+    scout.invite = invite || '';
+    state.fleet.push(scout);
+    updateFleetDisplay();
+    scout.room.join(scout.invite, { allowRandom: true });
+    return scout;
+  }
+
+  function removeScoutBot(scout) {
+    const idx = state.fleet.indexOf(scout);
+    if (idx >= 0) {
       try {
-        activeSelectionTeardown();
+        scout.room.leave();
       } catch (err) {
-        console.warn('drawaria image autodraw: selection overlay cleanup failed', err);
+        console.debug('Scout bot leave error', err);
       }
-      activeSelectionTeardown = null;
+      state.fleet.splice(idx, 1);
+      updateFleetDisplay();
     }
   }
 
-  function beginCanvasSelection() {
-    if (state.running) {
-      ui.status.textContent = 'Stop the current render before selecting a region.';
-      return;
-    }
-    const canvas = selectLargestCanvas();
-    if (!canvas) {
-      ui.status.textContent = 'Canvas not found — join a room before selecting a region.';
-      return;
-    }
+  function clearScoutBots() {
+    state.fleet.slice().forEach((scout) => removeScoutBot(scout));
+  }
 
-    clearActiveSelectionOverlay();
+  setupSocketTracking();
 
-    const rect = canvas.getBoundingClientRect();
-    const overlay = document.createElement('div');
-    overlay.id = 'pxa-selection-overlay';
-    overlay.style.left = `${rect.left}px`;
-    overlay.style.top = `${rect.top}px`;
-    overlay.style.width = `${rect.width}px`;
-    overlay.style.height = `${rect.height}px`;
+  state.bot = createBotLogic();
 
-    const selectionBox = document.createElement('div');
-    selectionBox.id = 'pxa-selection-box';
-    selectionBox.style.display = 'none';
-    overlay.appendChild(selectionBox);
+  function createBotLogic(options = {}) {
+    const settings = {
+      name: 'OmniDraw Bot',
+      invite: '',
+      primary: true,
+      allowRandom: false,
+      onStatusChange: null,
+      ...options,
+    };
 
-    document.body.appendChild(overlay);
-    ui.status.textContent = 'Drag a rectangle to place the artwork.';
+    const bot = {
+      name: settings.name || 'OmniDraw Bot',
+      invite: settings.invite || '',
+      status: 'idle',
+      lastError: null,
+      player: null,
+      room: null,
+      actions: null,
+      primary: Boolean(settings.primary),
+      allowRandom: Boolean(settings.allowRandom),
+    };
 
-    let dragging = false;
-    let startX = 0;
-    let startY = 0;
-
-    const clampToOverlay = (value, axis) => {
-      const bounds = overlay.getBoundingClientRect();
-      if (axis === 'x') {
-        return clamp(value, bounds.left, bounds.right);
+    const notify = () => {
+      if (bot.primary) {
+        updateBotDisplay();
+        updateConnectionStatus();
       }
-      return clamp(value, bounds.top, bounds.bottom);
-    };
-
-    const updateBox = (currentX, currentY) => {
-      const bounds = overlay.getBoundingClientRect();
-      const clampedX = clampToOverlay(currentX, 'x');
-      const clampedY = clampToOverlay(currentY, 'y');
-      const left = Math.min(startX, clampedX) - bounds.left;
-      const top = Math.min(startY, clampedY) - bounds.top;
-      const width = Math.max(1, Math.abs(clampedX - startX));
-      const height = Math.max(1, Math.abs(clampedY - startY));
-      selectionBox.style.left = `${left}px`;
-      selectionBox.style.top = `${top}px`;
-      selectionBox.style.width = `${width}px`;
-      selectionBox.style.height = `${height}px`;
-      selectionBox.style.display = 'block';
-    };
-
-    const finishSelection = (apply) => {
-      window.removeEventListener('mousemove', handlePointerMove, true);
-      window.removeEventListener('mouseup', handlePointerUp, true);
-      window.removeEventListener('keydown', handleKeyDown, true);
-
-      if (!apply || !dragging) {
-        overlay.remove();
-        activeSelectionTeardown = null;
-        if (apply) {
-          ui.status.textContent = 'Canvas region selection cancelled.';
+      if (typeof settings.onStatusChange === 'function') {
+        try {
+          settings.onStatusChange(bot);
+        } catch (err) {
+          console.debug('Bot status hook error', err);
         }
-        return;
-      }
-
-      const bounds = overlay.getBoundingClientRect();
-      const cssWidth = bounds.width || 1;
-      const cssHeight = bounds.height || 1;
-      const boxRect = selectionBox.getBoundingClientRect();
-      const leftPx = clamp(boxRect.left - bounds.left, 0, cssWidth);
-      const topPx = clamp(boxRect.top - bounds.top, 0, cssHeight);
-      const widthPx = clamp(boxRect.width, 1, cssWidth);
-      const heightPx = clamp(boxRect.height, 1, cssHeight);
-
-      const normX = leftPx / cssWidth;
-      const normY = topPx / cssHeight;
-      const normWidth = widthPx / cssWidth;
-      const normHeight = heightPx / cssHeight;
-
-      overlay.remove();
-      activeSelectionTeardown = null;
-
-      if (normWidth >= 0.995 && normHeight >= 0.995 && normX <= 0.002 && normY <= 0.002) {
-        state.selection = null;
-        ui.status.textContent = 'Canvas region reset to full coverage.';
-      } else {
-        state.selection = {
-          normX,
-          normY,
-          normWidth,
-          normHeight,
-          boardWidth: canvas.width,
-          boardHeight: canvas.height,
-        };
-        ui.status.textContent = `Region locked (${Math.round(normWidth * canvas.width)}×${Math.round(normHeight * canvas.height)}px).`;
-      }
-
-      state.commandCache = null;
-      updateSelectionUI();
-      if (state.prepared) {
-        scheduleMetricsUpdate();
       }
     };
 
-    const handlePointerDown = (event) => {
-      if (event.button !== 0) {
-        return;
+    const nullify = (value = null) => {
+      return value == null ? null : `"${value}"`;
+    };
+
+    const Connection = function (player) {
+      this.player = player;
+      this.socket = null;
+      this.pendingConnect = null;
+      this._hbTimer = null;
+    };
+
+    Connection.prototype.onopen = function () {
+      this.Heartbeat(25000);
+      bot.status = 'connected';
+      bot.lastError = null;
+      notify();
+    };
+
+    Connection.prototype.onclose = function (event) {
+      clearTimeout(this._hbTimer);
+      this.socket = null;
+      if (bot.status !== 'error') {
+        bot.status = 'idle';
       }
-      dragging = true;
-      startX = clampToOverlay(event.clientX, 'x');
-      startY = clampToOverlay(event.clientY, 'y');
-      updateBox(event.clientX, event.clientY);
-      event.preventDefault();
-    };
-
-    const handlePointerMove = (event) => {
-      if (!dragging) {
-        return;
+      if (event && event.code && event.code !== 1000) {
+        bot.lastError = `Socket closed (${event.code})`;
       }
-      updateBox(event.clientX, event.clientY);
-      event.preventDefault();
+      notify();
     };
 
-    const handlePointerUp = (event) => {
-      if (event.button !== 0) {
-        return;
-      }
-      event.preventDefault();
-      finishSelection(true);
+    Connection.prototype.onerror = function (event) {
+      bot.status = 'error';
+      bot.lastError = event?.message || 'Connection error';
+      notify();
     };
 
-    const handleKeyDown = (event) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        finishSelection(false);
-      }
-    };
-
-    overlay.addEventListener('mousedown', handlePointerDown, { capture: true, passive: false });
-    window.addEventListener('mousemove', handlePointerMove, true);
-    window.addEventListener('mouseup', handlePointerUp, true);
-    window.addEventListener('keydown', handleKeyDown, true);
-
-    activeSelectionTeardown = () => {
-      overlay.removeEventListener('mousedown', handlePointerDown, true);
-      window.removeEventListener('mousemove', handlePointerMove, true);
-      window.removeEventListener('mouseup', handlePointerUp, true);
-      window.removeEventListener('keydown', handleKeyDown, true);
-      if (overlay.parentNode) {
-        overlay.parentNode.removeChild(overlay);
-      }
-    };
-
-  }
-
-  function clearCanvasSelection() {
-    clearActiveSelectionOverlay();
-    if (!state.selection) {
-      ui.status.textContent = 'Canvas region already at full coverage.';
-      return;
-    }
-    state.selection = null;
-    state.commandCache = null;
-    state.metrics.selectionActive = false;
-    state.metrics.targetWidth = state.metrics.boardWidth || 0;
-    state.metrics.targetHeight = state.metrics.boardHeight || 0;
-    updateSelectionUI();
-    ui.status.textContent = 'Canvas region reset to full coverage.';
-    if (state.prepared) {
-      scheduleMetricsUpdate();
-    }
-  }
-
-  registerCleanup(() => clearActiveSelectionOverlay());
-
-  function createPanel() {
-    const style = document.createElement('style');
-    style.textContent = `
-      #pxa-panel { position: fixed; top: 24px; right: 24px; width: 520px; max-width: calc(100vw - 40px); max-height: calc(100vh - 40px); z-index: 999999; font-family: 'Inter', 'Segoe UI', sans-serif; color: #0f172a; border-radius: 24px; overflow: hidden; box-shadow: 0 32px 110px rgba(15, 23, 42, 0.45); background: linear-gradient(165deg, rgba(15,23,42,0.92), rgba(15,23,42,0.88)), linear-gradient(140deg, var(--pxa-ambient, rgba(148,163,184,0.18)), rgba(226,232,240,0.9)); backdrop-filter: blur(30px); border: 1px solid rgba(148,163,184,0.28); --pxa-accent: #2563eb; --pxa-accent-soft: rgba(37,99,235,0.16); --pxa-accent-dark: #1e3a8a; --pxa-chip-bg: rgba(255,255,255,0.16); --pxa-ambient: rgba(148,163,184,0.22); display: flex; flex-direction: column; }
-      #pxa-panel::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(120deg, rgba(255,255,255,0.08), transparent 45%, rgba(255,255,255,0.12)); opacity: 0.9; }
-      #pxa-panel::after { content: ''; position: absolute; inset: -40%; background: radial-gradient(circle at 20% 20%, rgba(37,99,235,0.25), transparent 55%), radial-gradient(circle at 80% 10%, rgba(6,182,212,0.18), transparent 45%); filter: blur(0); opacity: 0.75; animation: pxa-ambient 18s ease-in-out infinite alternate; pointer-events: none; }
-      #pxa-panel.running { box-shadow: 0 48px 140px rgba(37, 99, 235, 0.55); }
-      @keyframes pxa-ambient { 0% { transform: rotate(0deg) scale(1); opacity: 0.8; } 50% { transform: rotate(6deg) scale(1.08); opacity: 0.9; } 100% { transform: rotate(-4deg) scale(1.02); opacity: 0.75; } }
-      @media (prefers-reduced-motion: reduce) { #pxa-panel::after { animation: none; } }
-      #pxa-head { position: relative; display: flex; align-items: flex-start; gap: 16px; padding: 20px 28px 16px; cursor: grab; color: white; }
-      #pxa-logo { display: grid; place-items: center; width: 72px; height: 72px; border-radius: 22px; background: linear-gradient(140deg, rgba(255,255,255,0.18), rgba(255,255,255,0.02)); border: 1px solid rgba(255,255,255,0.24); box-shadow: inset 0 1px 12px rgba(15,23,42,0.45), 0 12px 34px rgba(15,23,42,0.4); font-weight: 700; letter-spacing: 0.12em; font-size: 14px; text-transform: uppercase; }
-      #pxa-logo span { display: block; text-align: center; }
-      #pxa-logo .pxa-logo-icon { font-size: 20px; }
-      #pxa-logo .pxa-logo-sub { font-size: 11px; opacity: 0.7; letter-spacing: 0.24em; }
-      #pxa-title { flex: 1; min-width: 0; padding-top: 6px; }
-      #pxa-title h1 { margin: 0; font-size: 22px; letter-spacing: 0.08em; font-weight: 700; text-transform: uppercase; }
-      #pxa-title p { margin: 6px 0 10px; font-size: 12px; opacity: 0.85; letter-spacing: 0.18em; text-transform: uppercase; }
-      #pxa-headline-band { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
-      .pxa-chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; background: var(--pxa-chip-bg); border: 1px solid rgba(255,255,255,0.16); box-shadow: inset 0 1px 1px rgba(255,255,255,0.22); backdrop-filter: blur(12px); }
-      .pxa-chip-dot { width: 8px; height: 8px; border-radius: 50%; background: #facc15; box-shadow: 0 0 0 6px rgba(250,204,21,0.18); position: relative; }
-      #pxa-chip-socket[data-status="connected"] .pxa-chip-dot { background: #34d399; box-shadow: 0 0 0 6px rgba(52,211,153,0.22); }
-      #pxa-chip-socket[data-status="offline"] .pxa-chip-dot { background: #f87171; box-shadow: 0 0 0 6px rgba(248,113,113,0.22); }
-      #pxa-chip-socket[data-status="searching"] .pxa-chip-dot { animation: pxa-pulse 1.8s ease infinite; }
-      @keyframes pxa-pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.35); opacity: 0.6; } }
-      .pxa-chip-icon { font-size: 13px; filter: drop-shadow(0 2px 6px rgba(15,23,42,0.45)); }
-      #pxa-close { border: none; background: rgba(15,23,42,0.45); color: white; width: 38px; height: 38px; border-radius: 12px; font-size: 16px; cursor: pointer; transition: transform 0.2s ease, background 0.2s ease; box-shadow: 0 12px 22px rgba(15,23,42,0.4); }
-      #pxa-close:hover { transform: translateY(-2px) scale(1.04); background: rgba(15,23,42,0.65); }
-      #pxa-body { position: relative; padding: 0 28px 20px; display: flex; flex-direction: column; gap: 18px; flex: 1; overflow: hidden; }
-      #pxa-body::before { content: ''; position: absolute; inset: 12px 18px 18px; border-radius: 22px; background: linear-gradient(150deg, rgba(248,250,252,0.94), rgba(226,232,240,0.82)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
-      #pxa-body::after { content: ''; position: absolute; inset: 20px 24px 24px; border-radius: 18px; background: linear-gradient(120deg, rgba(255,255,255,0.25), transparent 60%); opacity: 0.35; pointer-events: none; }
-      #pxa-body > * { position: relative; z-index: 2; }
-      #pxa-scroll-area { position: relative; flex: 1; overflow-y: auto; padding: 12px 4px 16px 4px; display: flex; flex-direction: column; gap: 18px; scrollbar-color: var(--pxa-accent) rgba(148,163,184,0.16); }
-      #pxa-scroll-area::-webkit-scrollbar { width: 8px; }
-      #pxa-scroll-area::-webkit-scrollbar-track { background: rgba(148,163,184,0.12); border-radius: 999px; }
-      #pxa-scroll-area::-webkit-scrollbar-thumb { background: linear-gradient(180deg, var(--pxa-accent), var(--pxa-accent-dark)); border-radius: 999px; box-shadow: 0 4px 12px rgba(37,99,235,0.32); }
-      .pxa-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; background: rgba(255,255,255,0.72); border-radius: 18px; padding: 8px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); border: 1px solid rgba(148,163,184,0.24); }
-      .pxa-tab { border: none; border-radius: 12px; padding: 12px 0; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; font-size: 11px; cursor: pointer; color: rgba(30,41,59,0.72); background: rgba(148,163,184,0.12); transition: all 0.22s ease; }
-      .pxa-tab:hover { filter: brightness(1.06); }
-      .pxa-tab.active { background: linear-gradient(135deg, var(--pxa-accent), var(--pxa-accent-dark)); color: white; box-shadow: 0 14px 28px rgba(37,99,235,0.32); }
-      .pxa-tab-panels { display: flex; flex-direction: column; gap: 18px; }
-      .pxa-tab-panel { display: none; }
-      .pxa-tab-panel.active { display: block; }
-      .pxa-section { background: rgba(255,255,255,0.85); border-radius: 22px; padding: 22px 24px 24px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.65), 0 22px 40px rgba(15,23,42,0.1); border: 1px solid rgba(148,163,184,0.28); }
-      .pxa-section h2 { margin: 0 0 16px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--pxa-accent-dark); }
-      .pxa-controls { display: grid; gap: 16px; }
-      .pxa-field { display: grid; gap: 8px; }
-      .pxa-label { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #475569; font-weight: 700; }
-      .pxa-input, .pxa-slider, .pxa-select { width: 100%; border: 1px solid rgba(148,163,184,0.45); border-radius: 14px; padding: 11px 14px; font-size: 13px; background: rgba(255,255,255,0.86); color: #0f172a; box-shadow: inset 0 1px 1px rgba(255,255,255,0.9); transition: border 0.2s ease, box-shadow 0.2s ease; }
-      .pxa-input:focus, .pxa-slider:focus, .pxa-select:focus { border-color: var(--pxa-accent); box-shadow: 0 0 0 3px rgba(37,99,235,0.18); outline: none; }
-      .pxa-slider { -webkit-appearance: none; height: 8px; padding: 0; border-radius: 999px; background: linear-gradient(90deg, rgba(37,99,235,0.75), rgba(6,182,212,0.75)); position: relative; }
-      .pxa-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; background: white; border-radius: 50%; border: 3px solid var(--pxa-accent); box-shadow: 0 6px 16px rgba(37,99,235,0.35); cursor: grab; }
-      .pxa-slider::-moz-range-thumb { width: 20px; height: 20px; background: white; border-radius: 50%; border: 3px solid var(--pxa-accent); box-shadow: 0 6px 16px rgba(37,99,235,0.35); cursor: grab; }
-      .pxa-value { font-size: 11px; letter-spacing: 0.12em; color: #0f172a; text-transform: uppercase; display: inline-flex; justify-content: flex-end; }
-      .pxa-buttons { display: grid; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: 12px; }
-      .pxa-btn { border: none; border-radius: 14px; padding: 14px 0; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; font-size: 11px; cursor: pointer; transition: transform 0.22s ease, box-shadow 0.22s ease, filter 0.22s ease; position: relative; overflow: hidden; }
-      .pxa-btn:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none !important; transform: none !important; filter: none !important; }
-      .pxa-btn::after { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(255,255,255,0.18), transparent 55%); opacity: 0; transition: opacity 0.22s ease; }
-      .pxa-btn:hover::after { opacity: 1; }
-      .pxa-btn.primary { background: linear-gradient(135deg, var(--pxa-accent), var(--pxa-accent-dark)); color: white; box-shadow: 0 18px 32px rgba(37,99,235,0.35); }
-      .pxa-btn.primary:hover { transform: translateY(-2px); box-shadow: 0 24px 42px rgba(30,64,175,0.45); }
-      .pxa-btn.secondary { background: rgba(255,255,255,0.92); color: #0f172a; border: 1px solid rgba(148,163,184,0.35); box-shadow: 0 16px 30px rgba(15,23,42,0.12); }
-      .pxa-btn.secondary:hover { transform: translateY(-2px); filter: brightness(1.02); }
-      .pxa-btn.danger { background: linear-gradient(135deg, #f43f5e, #be123c); color: white; box-shadow: 0 18px 34px rgba(244,63,94,0.36); }
-      .pxa-btn.danger:hover { transform: translateY(-2px); }
-      .pxa-toggle-row { display: flex; flex-wrap: wrap; gap: 18px; }
-      .pxa-toggle-group { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 14px; background: rgba(148,163,184,0.14); border: 1px solid rgba(148,163,184,0.28); }
-      .pxa-selection-control { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 18px; border-radius: 18px; background: rgba(148,163,184,0.18); border: 1px solid rgba(148,163,184,0.32); box-shadow: inset 0 1px 0 rgba(255,255,255,0.18); }
-      .pxa-selection-info { display: grid; gap: 6px; min-width: 200px; }
-      #pxa-selection-details { font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #1f2937; }
-      #pxa-selection-details[data-state="active"] { color: var(--pxa-accent-dark); }
-      .pxa-selection-actions { display: flex; flex-wrap: wrap; gap: 10px; }
-      .pxa-mini-btn { border: none; border-radius: 999px; padding: 10px 18px; font-weight: 700; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer; background: rgba(255,255,255,0.92); color: #0f172a; box-shadow: 0 12px 24px rgba(15,23,42,0.16); transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease; }
-      .pxa-mini-btn.primary { background: linear-gradient(135deg, var(--pxa-accent), var(--pxa-accent-dark)); color: white; box-shadow: 0 16px 30px rgba(37,99,235,0.32); }
-      .pxa-mini-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.02); }
-      .pxa-mini-btn:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
-      .pxa-switch { position: relative; width: 54px; height: 28px; border-radius: 999px; border: none; cursor: pointer; background: rgba(148,163,184,0.4); transition: background 0.22s ease, box-shadow 0.22s ease; padding: 0; }
-      .pxa-switch[data-active="true"] { background: linear-gradient(135deg, var(--pxa-accent), var(--pxa-accent-dark)); box-shadow: 0 10px 20px rgba(37,99,235,0.35); }
-      .pxa-switch-handle { position: absolute; top: 4px; left: 4px; width: 20px; height: 20px; border-radius: 50%; background: white; box-shadow: 0 6px 12px rgba(15,23,42,0.25); transition: transform 0.22s ease; }
-      .pxa-switch[data-active="true"] .pxa-switch-handle { transform: translateX(26px); }
-      .pxa-preview-grid { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 20px; align-items: stretch; }
-      @media (max-width: 720px) { .pxa-preview-grid { grid-template-columns: 1fr; } }
-      #pxa-preview-wrapper { position: relative; border-radius: 18px; overflow: hidden; background: linear-gradient(145deg, rgba(15,23,42,0.96), rgba(15,23,42,0.86)); min-height: 220px; border: 1px solid rgba(15,23,42,0.4); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); }
-      #pxa-preview { width: 100%; height: 100%; display: block; }
-      #pxa-preview::selection { background: transparent; }
-      #pxa-preview-loading { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(15,23,42,0.72); color: white; font-weight: 600; font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; opacity: 0; pointer-events: none; transition: opacity 0.3s ease; }
-      #pxa-preview-loading.visible { opacity: 1; }
-      .pxa-metrics-grid { display: grid; gap: 12px; align-content: flex-start; }
-      .pxa-metric-card { background: rgba(15,23,42,0.05); border-radius: 16px; padding: 14px 16px; border: 1px solid rgba(148,163,184,0.25); box-shadow: inset 0 1px 0 rgba(255,255,255,0.65); display: grid; gap: 4px; }
-      .pxa-metric-label { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #64748b; }
-      .pxa-metric-value { font-size: 20px; font-weight: 700; color: #0f172a; letter-spacing: 0.02em; }
-      .pxa-metric-sub { font-size: 11px; letter-spacing: 0.1em; color: #475569; text-transform: uppercase; }
-      .pxa-secondary-actions { display: grid; gap: 10px; margin-top: 14px; }
-      .pxa-secondary-actions .pxa-btn { font-size: 10px; padding: 12px; }
-      .pxa-meta { display: flex; justify-content: space-between; align-items: center; font-size: 11px; text-transform: uppercase; color: #475569; letter-spacing: 0.08em; margin-top: 12px; }
-      #pxa-progress { position: relative; height: 12px; border-radius: 999px; background: rgba(15,23,42,0.08); overflow: hidden; border: 1px solid rgba(148,163,184,0.24); }
-      #pxa-progress-bar { position: absolute; inset: 0; width: 0%; background: linear-gradient(90deg, #22d3ee, var(--pxa-accent)); box-shadow: 0 8px 22px rgba(59,130,246,0.38); transition: width 0.2s ease; }
-      #pxa-progress-label { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-size: 11px; font-weight: 700; color: rgba(15,23,42,0.82); letter-spacing: 0.12em; }
-      #pxa-status { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: #1f2937; font-weight: 700; margin-top: 12px; }
-      #pxa-selection-overlay { position: fixed; z-index: 999998; border: 1px solid rgba(37,99,235,0.45); background: rgba(37,99,235,0.08); box-shadow: 0 0 0 1px rgba(37,99,235,0.32), 0 32px 80px rgba(15,23,42,0.25); cursor: crosshair; backdrop-filter: blur(4px); }
-      #pxa-selection-overlay::after { content: 'Drag to place the artwork'; position: absolute; top: 12px; left: 50%; transform: translateX(-50%); padding: 6px 14px; border-radius: 999px; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: white; background: rgba(15,23,42,0.65); box-shadow: 0 12px 24px rgba(15,23,42,0.35); pointer-events: none; }
-      #pxa-selection-box { position: absolute; border: 2px dashed rgba(255,255,255,0.85); border-radius: 12px; background: rgba(37,99,235,0.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28), 0 18px 40px rgba(37,99,235,0.25); pointer-events: none; }
-      #pxa-footer { padding: 16px 28px 22px; display: grid; gap: 10px; background: rgba(15,23,42,0.04); border-top: 1px solid rgba(148,163,184,0.25); box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
-      #pxa-palette-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(22px, 1fr)); gap: 6px; border-radius: 16px; padding: 12px; background: rgba(15,23,42,0.06); border: 1px solid rgba(148,163,184,0.32); max-height: 200px; overflow-y: auto; }
-      .pxa-swatch { width: 100%; padding-bottom: 100%; border-radius: 10px; position: relative; box-shadow: inset 0 0 0 1px rgba(15,23,42,0.12); }
-      .pxa-swatch::after { content: ''; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }
-      .pxa-swatch[data-dominant="true"] { box-shadow: 0 0 0 2px var(--pxa-accent), inset 0 0 0 1px rgba(15,23,42,0.2); }
-      .pxa-fun-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 18px; margin-bottom: 18px; }
-      .pxa-fun-note { margin-top: -4px; margin-bottom: 18px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(15,23,42,0.6); }
-      .pxa-fun-actions { display: flex; flex-wrap: wrap; gap: 12px; }
-      .pxa-fun-progress { position: relative; width: 100%; height: 12px; border-radius: 999px; background: rgba(148,163,184,0.28); overflow: hidden; margin-top: 20px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.45); }
-      .pxa-fun-progress-bar { position: absolute; inset: 0; width: 0%; background: linear-gradient(135deg, rgba(37,99,235,0.85), rgba(6,182,212,0.85)); box-shadow: 0 10px 24px rgba(37,99,235,0.35); transition: width 0.3s ease; }
-      .pxa-fun-status { margin-top: 12px; font-size: 12px; letter-spacing: 0.09em; text-transform: uppercase; color: #1f2937; }
-      .pxa-fun-description { margin-bottom: 12px; font-size: 12px; letter-spacing: 0.06em; color: rgba(15,23,42,0.75); }
-      #pxa-palette-insights { display: grid; gap: 12px; margin-top: 16px; }
-      .pxa-insight-card { border-radius: 16px; padding: 16px; background: rgba(37,99,235,0.08); border: 1px solid rgba(37,99,235,0.16); box-shadow: inset 0 1px 0 rgba(255,255,255,0.45); display: grid; gap: 6px; }
-      .pxa-insight-card strong { font-size: 14px; letter-spacing: 0.02em; color: var(--pxa-accent-dark); }
-      .pxa-insight-card span { font-size: 12px; color: #334155; letter-spacing: 0.04em; }
-      .pxa-advanced-grid { display: grid; gap: 18px; }
-      .pxa-two-column { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
-      #pxa-advanced-note { font-size: 11px; letter-spacing: 0.08em; color: #475569; text-transform: uppercase; }
-      input[type='file'].shake { animation: pxa-shake 0.45s ease; }
-      @keyframes pxa-shake { 0%, 100% { transform: translateX(0); } 20%, 60% { transform: translateX(-6px); } 40%, 80% { transform: translateX(6px); } }
-    `;
-    document.head.appendChild(style);
-
-    const panel = document.createElement('div');
-    panel.id = 'pxa-panel';
-    panel.innerHTML = `
-      <div id="pxa-head">
-        <div id="pxa-logo"><span class="pxa-logo-icon">PX</span><span class="pxa-logo-sub">Studio</span></div>
-        <div id="pxa-title">
-          <h1>Autodraw Studio</h1>
-          <p>WebSocket Pixel Renderer</p>
-          <div id="pxa-headline-band">
-            <div class="pxa-chip" id="pxa-chip-socket" data-status="searching"><span class="pxa-chip-dot"></span><span id="pxa-socket-label">Socket: searching…</span></div>
-            <div class="pxa-chip" id="pxa-chip-mode"><span class="pxa-chip-icon">✨</span><span id="pxa-mode-label">Balanced detail</span></div>
-          </div>
-        </div>
-        <button id="pxa-close">✕</button>
-      </div>
-      <div id="pxa-body">
-        <div class="pxa-tabs">
-          <button class="pxa-tab active" data-tab="setup">Setup</button>
-          <button class="pxa-tab" data-tab="preview">Preview</button>
-          <button class="pxa-tab" data-tab="palette">Palette</button>
-          <button class="pxa-tab" data-tab="advanced">Advanced</button>
-          <button class="pxa-tab" data-tab="fun">Fun Lab</button>
-        </div>
-        <div id="pxa-scroll-area">
-          <div class="pxa-tab-panels">
-          <section class="pxa-section pxa-tab-panel active" data-tab="setup">
-            <h2>Setup</h2>
-            <div class="pxa-controls">
-              <label class="pxa-field">
-                <span class="pxa-label">Image File</span>
-                <input id="pxa-file" type="file" accept="image/*" class="pxa-input" />
-              </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Max Dimension (px)</span>
-                <input id="pxa-dimension" type="range" min="64" max="500" value="500" class="pxa-slider" />
-                <div class="pxa-meta"><span>64px</span><span id="pxa-dimension-value">500px</span></div>
-              </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Colour Order</span>
-                <select id="pxa-colour-order" class="pxa-select">
-                  <option value="dark-first" selected>Dark → Light</option>
-                  <option value="light-first">Light → Dark</option>
-                  <option value="coverage">Coverage Priority</option>
-                </select>
-              </label>
-              <div class="pxa-toggle-row">
-                <div class="pxa-toggle-group">
-                  <span class="pxa-label">Auto start after preview</span>
-                  <button type="button" class="pxa-switch" id="pxa-toggle-autostart" data-active="false" aria-pressed="false"><span class="pxa-switch-handle"></span></button>
-                </div>
-                <div class="pxa-toggle-group">
-                  <span class="pxa-label">Adaptive theme</span>
-                  <button type="button" class="pxa-switch" id="pxa-toggle-theme" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-                </div>
-              </div>
-              <div class="pxa-selection-control">
-                <div class="pxa-selection-info">
-                  <span class="pxa-label">Canvas region</span>
-                  <span id="pxa-selection-details">Full canvas coverage</span>
-                </div>
-                <div class="pxa-selection-actions">
-                  <button class="pxa-mini-btn primary" id="pxa-select-region" type="button">Set region</button>
-                  <button class="pxa-mini-btn" id="pxa-clear-region" type="button" disabled>Reset</button>
-                </div>
-              </div>
-              <div class="pxa-buttons">
-                <button class="pxa-btn secondary" id="pxa-preview-btn">Generate Preview</button>
-                <button class="pxa-btn primary" id="pxa-start">Start Drawing</button>
-                <button class="pxa-btn danger" id="pxa-stop" disabled>Stop</button>
-              </div>
-            </div>
-          </section>
-
-          <section class="pxa-section pxa-tab-panel" data-tab="preview">
-            <h2>Preview & Metrics</h2>
-            <div class="pxa-preview-grid">
-              <div id="pxa-preview-wrapper">
-                <canvas id="pxa-preview" width="420" height="260"></canvas>
-                <div id="pxa-preview-loading">Processing…</div>
-              </div>
-              <div class="pxa-metrics-grid">
-                <div class="pxa-metric-card">
-                  <span class="pxa-metric-label">Resolution</span>
-                  <span class="pxa-metric-value" id="pxa-metric-resolution">—</span>
-                  <span class="pxa-metric-sub" id="pxa-metric-scale">Fit-to-canvas ready</span>
-                </div>
-                <div class="pxa-metric-card">
-                  <span class="pxa-metric-label">Palette</span>
-                  <span class="pxa-metric-value" id="pxa-metric-palette">0</span>
-                  <span class="pxa-metric-sub" id="pxa-metric-palette-note">Up to 1300 colours</span>
-                </div>
-                <div class="pxa-metric-card">
-                  <span class="pxa-metric-label">Stroke Estimate</span>
-                  <span class="pxa-metric-value" id="pxa-metric-strokes">0</span>
-                  <span class="pxa-metric-sub" id="pxa-metric-lanes">Lane fan ×1</span>
-                </div>
-                <div class="pxa-metric-card">
-                  <span class="pxa-metric-label">Estimated Runtime</span>
-                  <span class="pxa-metric-value" id="pxa-metric-eta">0s</span>
-                  <span class="pxa-metric-sub" id="pxa-metric-delay">8ms stroke delay</span>
-                </div>
-              </div>
-            </div>
-            <div class="pxa-secondary-actions">
-              <button class="pxa-btn secondary" id="pxa-export-preview">Download processed PNG</button>
-              <button class="pxa-btn secondary" id="pxa-copy-palette">Copy palette to clipboard</button>
-            </div>
-            <div class="pxa-meta"><span id="pxa-palette-summary">0 colours</span><span>1px brush</span></div>
-          </section>
-
-          <section class="pxa-section pxa-tab-panel" data-tab="palette">
-            <h2>Palette Insights</h2>
-            <div class="pxa-meta"><span id="pxa-palette-summary-secondary">0 colours</span><span>Order linked to setup tab</span></div>
-            <div id="pxa-palette-strip"></div>
-            <div id="pxa-palette-insights"></div>
-          </section>
-
-          <section class="pxa-section pxa-tab-panel" data-tab="advanced">
-            <h2>Advanced Painter Controls</h2>
-            <div class="pxa-advanced-grid">
-              <div class="pxa-two-column">
-                <label class="pxa-field">
-                  <span class="pxa-label">Smoothness boost</span>
-                  <input id="pxa-smoothness" type="range" min="0" max="100" value="40" class="pxa-slider" />
-                  <span class="pxa-value" id="pxa-smoothness-value">40%</span>
-                </label>
-                <label class="pxa-field">
-                  <span class="pxa-label">Lane density</span>
-                  <input id="pxa-lane-density" type="range" min="60" max="200" value="100" class="pxa-slider" />
-                  <span class="pxa-value" id="pxa-lane-density-value">100%</span>
-                </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Coverage padding</span>
-                <input id="pxa-coverage" type="range" min="80" max="180" value="100" class="pxa-slider" />
-                <span class="pxa-value" id="pxa-coverage-value">100%</span>
-              </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Dither strength</span>
-                <input id="pxa-dither" type="range" min="0" max="200" value="100" class="pxa-slider" />
-                <span class="pxa-value" id="pxa-dither-value">100%</span>
-              </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Spectral accent</span>
-                <input id="pxa-spectral" type="range" min="50" max="200" value="120" class="pxa-slider" />
-                <span class="pxa-value" id="pxa-spectral-value">120%</span>
-              </label>
-            </div>
-            <div class="pxa-two-column">
-              <label class="pxa-field">
-                <span class="pxa-label">Detail cadence</span>
-                <select id="pxa-detail-mode" class="pxa-select">
-                    <option value="balanced" selected>Balanced</option>
-                    <option value="max">Maximum</option>
-                    <option value="minimal">Minimal</option>
-                  </select>
-                </label>
-                <div class="pxa-toggle-group">
-                  <span class="pxa-label">Low-res enhancer</span>
-                  <button type="button" class="pxa-switch" id="pxa-toggle-lowres" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-                </div>
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Edge emphasis</span>
-                <button type="button" class="pxa-switch" id="pxa-toggle-edge" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-              </div>
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Micro detail</span>
-                <button type="button" class="pxa-switch" id="pxa-toggle-micro" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-              </div>
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Glow glazing</span>
-                <button type="button" class="pxa-switch" id="pxa-toggle-glaze" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-              </div>
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Texture weave</span>
-                <button type="button" class="pxa-switch" id="pxa-toggle-weave" data-active="false" aria-pressed="false"><span class="pxa-switch-handle"></span></button>
-              </div>
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Gradient echo</span>
-                <button type="button" class="pxa-switch" id="pxa-toggle-echo" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-              </div>
-            </div>
-            <div id="pxa-advanced-note">Changes apply to the next draw and live estimates will update automatically.</div>
-          </div>
-        </section>
-          <section class="pxa-section pxa-tab-panel" data-tab="fun">
-            <h2>Fun Lab Experiments</h2>
-            <div class="pxa-fun-description" id="pxa-fun-description">Layer playful pointer-driven effects over your canvas without touching the websocket painter.</div>
-            <div class="pxa-fun-grid">
-              <label class="pxa-field">
-                <span class="pxa-label">Effect</span>
-                <select id="pxa-fun-mode" class="pxa-select">
-                  <option value="aurora">Aurora sweep</option>
-                  <option value="vortex">Vortex bloom</option>
-                  <option value="firefly">Firefly scatter</option>
-                  <option value="cascade">Cascade drapery</option>
-                </select>
-              </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Density</span>
-                <input id="pxa-fun-density" type="range" min="10" max="120" value="70" class="pxa-slider" />
-                <span class="pxa-value" id="pxa-fun-density-value">70</span>
-              </label>
-              <label class="pxa-field">
-                <span class="pxa-label">Tempo</span>
-                <input id="pxa-fun-tempo" type="range" min="10" max="160" value="60" class="pxa-slider" />
-                <span class="pxa-value" id="pxa-fun-tempo-value">60</span>
-              </label>
-            </div>
-            <div class="pxa-toggle-row">
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Mirror sweeps</span>
-                <button type="button" class="pxa-switch" id="pxa-fun-toggle-mirror" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-              </div>
-              <div class="pxa-toggle-group">
-                <span class="pxa-label">Jitter accents</span>
-                <button type="button" class="pxa-switch" id="pxa-fun-toggle-jitter" data-active="true" aria-pressed="true"><span class="pxa-switch-handle"></span></button>
-              </div>
-            </div>
-            <div class="pxa-fun-note">Prep your brush size &amp; colour in Drawaria before pressing play — the fun lab reuses whatever is active.</div>
-            <div class="pxa-fun-actions">
-              <button class="pxa-btn primary" id="pxa-fun-run" type="button">Play effect</button>
-              <button class="pxa-btn danger" id="pxa-fun-stop" type="button" disabled>Stop</button>
-            </div>
-            <div class="pxa-fun-progress"><div class="pxa-fun-progress-bar" id="pxa-fun-progress-bar"></div></div>
-            <div class="pxa-fun-status" id="pxa-fun-status">Select an effect and press play.</div>
-          </section>
-          </div>
-        </div>
-      </div>
-      <div id="pxa-footer">
-        <div id="pxa-progress"><div id="pxa-progress-bar"></div><div id="pxa-progress-label">0%</div></div>
-        <div id="pxa-status">Select an image to begin (max 500px).</div>
-      </div>
-    `;
-    document.body.appendChild(panel);
-
-    const head = panel.querySelector('#pxa-head');
-    let dragOffsetX = 0;
-    let dragOffsetY = 0;
-    let dragging = false;
-
-    const handlePointerDown = (event) => {
-      dragging = true;
-      const rect = panel.getBoundingClientRect();
-      dragOffsetX = event.clientX - rect.left;
-      dragOffsetY = event.clientY - rect.top;
-      panel.style.transition = 'none';
-      head.style.cursor = 'grabbing';
-      event.preventDefault();
-    };
-
-    const handlePointerMove = (event) => {
-      if (!dragging) return;
-      panel.style.left = `${event.clientX - dragOffsetX}px`;
-      panel.style.top = `${event.clientY - dragOffsetY}px`;
-      panel.style.right = 'auto';
-      panel.style.bottom = 'auto';
-    };
-
-    const handlePointerUp = () => {
-      dragging = false;
-      head.style.cursor = 'grab';
-      panel.style.transition = '';
-    };
-
-    head.addEventListener('mousedown', handlePointerDown);
-    window.addEventListener('mousemove', handlePointerMove);
-    window.addEventListener('mouseup', handlePointerUp);
-
-    registerCleanup(() => {
-      head.removeEventListener('mousedown', handlePointerDown);
-      window.removeEventListener('mousemove', handlePointerMove);
-      window.removeEventListener('mouseup', handlePointerUp);
-    });
-
-    const tabButtons = Array.from(panel.querySelectorAll('.pxa-tab'));
-    const tabPanels = Array.from(panel.querySelectorAll('.pxa-tab-panel'));
-
-    const activateTab = (name) => {
-      tabButtons.forEach((btn) => {
-        btn.classList.toggle('active', btn.dataset.tab === name);
-      });
-      tabPanels.forEach((tabPanel) => {
-        tabPanel.classList.toggle('active', tabPanel.dataset.tab === name);
-      });
-    };
-
-    tabButtons.forEach((btn) => {
-      const onClick = () => activateTab(btn.dataset.tab);
-      btn.addEventListener('click', onClick);
-      registerCleanup(() => btn.removeEventListener('click', onClick));
-    });
-
-    activateTab('setup');
-
-    return {
-      panel,
-      style,
-      fileInput: panel.querySelector('#pxa-file'),
-      dimensionInput: panel.querySelector('#pxa-dimension'),
-      previewCanvas: panel.querySelector('#pxa-preview'),
-      previewButton: panel.querySelector('#pxa-preview-btn'),
-      startButton: panel.querySelector('#pxa-start'),
-      stopButton: panel.querySelector('#pxa-stop'),
-      closeButton: panel.querySelector('#pxa-close'),
-      status: panel.querySelector('#pxa-status'),
-      progressBar: panel.querySelector('#pxa-progress-bar'),
-      progressLabel: panel.querySelector('#pxa-progress-label'),
-      paletteStrip: panel.querySelector('#pxa-palette-strip'),
-      paletteSummary: panel.querySelector('#pxa-palette-summary'),
-      paletteSummarySecondary: panel.querySelector('#pxa-palette-summary-secondary'),
-      paletteInsights: panel.querySelector('#pxa-palette-insights'),
-      selectionDetails: panel.querySelector('#pxa-selection-details'),
-      selectRegionButton: panel.querySelector('#pxa-select-region'),
-      clearRegionButton: panel.querySelector('#pxa-clear-region'),
-      previewLoading: panel.querySelector('#pxa-preview-loading'),
-      dimensionValue: panel.querySelector('#pxa-dimension-value'),
-      paletteOrderSelect: panel.querySelector('#pxa-colour-order'),
-      socketChip: panel.querySelector('#pxa-chip-socket'),
-      socketLabel: panel.querySelector('#pxa-socket-label'),
-      modeLabel: panel.querySelector('#pxa-mode-label'),
-      metricResolution: panel.querySelector('#pxa-metric-resolution'),
-      metricScale: panel.querySelector('#pxa-metric-scale'),
-      metricPalette: panel.querySelector('#pxa-metric-palette'),
-      metricPaletteNote: panel.querySelector('#pxa-metric-palette-note'),
-      metricStrokes: panel.querySelector('#pxa-metric-strokes'),
-      metricLanes: panel.querySelector('#pxa-metric-lanes'),
-      metricEta: panel.querySelector('#pxa-metric-eta'),
-      metricDelay: panel.querySelector('#pxa-metric-delay'),
-      exportPreviewButton: panel.querySelector('#pxa-export-preview'),
-      copyPaletteButton: panel.querySelector('#pxa-copy-palette'),
-      smoothnessInput: panel.querySelector('#pxa-smoothness'),
-      smoothnessValue: panel.querySelector('#pxa-smoothness-value'),
-      laneDensityInput: panel.querySelector('#pxa-lane-density'),
-      laneDensityValue: panel.querySelector('#pxa-lane-density-value'),
-      coverageInput: panel.querySelector('#pxa-coverage'),
-      coverageValue: panel.querySelector('#pxa-coverage-value'),
-      ditherInput: panel.querySelector('#pxa-dither'),
-      ditherValue: panel.querySelector('#pxa-dither-value'),
-      spectralInput: panel.querySelector('#pxa-spectral'),
-      spectralValue: panel.querySelector('#pxa-spectral-value'),
-      detailModeSelect: panel.querySelector('#pxa-detail-mode'),
-      toggleLowRes: panel.querySelector('#pxa-toggle-lowres'),
-      toggleEdge: panel.querySelector('#pxa-toggle-edge'),
-      toggleMicro: panel.querySelector('#pxa-toggle-micro'),
-      toggleGlaze: panel.querySelector('#pxa-toggle-glaze'),
-      toggleWeave: panel.querySelector('#pxa-toggle-weave'),
-      toggleEcho: panel.querySelector('#pxa-toggle-echo'),
-      toggleTheme: panel.querySelector('#pxa-toggle-theme'),
-      toggleAutoStart: panel.querySelector('#pxa-toggle-autostart'),
-      funModeSelect: panel.querySelector('#pxa-fun-mode'),
-      funDensityInput: panel.querySelector('#pxa-fun-density'),
-      funDensityValue: panel.querySelector('#pxa-fun-density-value'),
-      funTempoInput: panel.querySelector('#pxa-fun-tempo'),
-      funTempoValue: panel.querySelector('#pxa-fun-tempo-value'),
-      funMirrorToggle: panel.querySelector('#pxa-fun-toggle-mirror'),
-      funJitterToggle: panel.querySelector('#pxa-fun-toggle-jitter'),
-      funRunButton: panel.querySelector('#pxa-fun-run'),
-      funStopButton: panel.querySelector('#pxa-fun-stop'),
-      funProgressBar: panel.querySelector('#pxa-fun-progress-bar'),
-      funStatus: panel.querySelector('#pxa-fun-status'),
-      funDescription: panel.querySelector('#pxa-fun-description'),
-    };
-  }
-
-  function installSocketBridge() {
-    const HANDLE = '__drawariaAutodrawSocketBridge';
-    if (window[HANDLE]) {
-      window[HANDLE].refCount += 1;
-      return window[HANDLE];
-    }
-
-    const sockets = new Set();
-    const originalSend = WebSocket.prototype.send;
-
-    function track(socket) {
-      if (sockets.has(socket)) {
-        return;
-      }
-      sockets.add(socket);
-      socket.addEventListener('close', () => sockets.delete(socket));
-      socket.addEventListener('error', () => sockets.delete(socket));
-    }
-
-    function patchedSend(...args) {
-      track(this);
-      return originalSend.apply(this, args);
-    }
-
-    WebSocket.prototype.send = patchedSend;
-
-    const bridge = {
-      refCount: 1,
-      release() {
-        bridge.refCount -= 1;
-        if (bridge.refCount <= 0) {
-          WebSocket.prototype.send = originalSend;
-          sockets.clear();
-          delete window[HANDLE];
+    Connection.prototype.onmessage = function (event) {
+      const message = String(event.data);
+      if (message.startsWith('42')) {
+        this.onbroadcast(message.slice(2));
+      } else if (message.startsWith('40')) {
+        this.onrequest();
+      } else if (message.startsWith('430')) {
+        try {
+          const configs = JSON.parse(message.slice(3))[0];
+          if (configs) {
+            this.player.room.id = configs.roomid ?? this.player.room.id;
+            this.player.room.players = configs.players ?? this.player.room.players;
+          }
+        } catch (err) {
+          console.debug('OmniDraw bot config parse failed', err);
         }
-      },
-      getSocket() {
-        const list = Array.from(sockets);
-        for (let i = list.length - 1; i >= 0; i--) {
-          const socket = list[i];
-          if (socket && socket.readyState === WebSocket.OPEN) {
-            return socket;
+        notify();
+      }
+    };
+
+    Connection.prototype.onbroadcast = function (payload) {
+      try {
+        const data = JSON.parse(payload);
+        if (data[0] === 'bc_uc_freedrawsession_changedroom') {
+          this.player.room.players = data[3] ?? this.player.room.players;
+          this.player.room.id = data[4] ?? this.player.room.id;
+        } else if (data[0] === 'mc_roomplayerschange') {
+          this.player.room.players = data[3] ?? this.player.room.players;
+        }
+        notify();
+      } catch (err) {
+        console.debug('OmniDraw bot broadcast parse failed', err);
+      }
+    };
+
+    Connection.prototype.onrequest = function () {};
+
+    Connection.prototype.open = function (url) {
+      if (this.socket) {
+        try {
+          this.socket.close(1000, 'reconnect');
+        } catch (err) {
+          console.debug('OmniDraw bot close issue', err);
+        }
+      }
+      bot.status = 'connecting';
+      bot.lastError = null;
+      notify();
+      clearTimeout(this._hbTimer);
+      try {
+        this.socket = new WebSocket(url);
+      } catch (err) {
+        bot.status = 'error';
+        bot.lastError = err?.message || 'Failed to open socket';
+        notify();
+        return;
+      }
+      trackSocket(this.socket);
+      this.socket.onopen = this.onopen.bind(this);
+      this.socket.onclose = this.onclose.bind(this);
+      this.socket.onerror = this.onerror.bind(this);
+      this.socket.onmessage = this.onmessage.bind(this);
+    };
+
+    Connection.prototype.close = function (code, reason) {
+      if (this.socket) {
+        try {
+          this.socket.close(code, reason);
+        } catch (err) {
+          console.debug('OmniDraw bot close error', err);
+        }
+      }
+      clearTimeout(this._hbTimer);
+      this.socket = null;
+    };
+
+    Connection.prototype.Heartbeat = function (interval) {
+      if (!interval) return;
+      clearTimeout(this._hbTimer);
+      this._hbTimer = setTimeout(() => {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+          try {
+            this.socket.send(2);
+            this.Heartbeat(interval);
+          } catch (err) {
+            console.debug('OmniDraw bot heartbeat error', err);
           }
         }
-        return null;
-      },
+      }, interval);
     };
 
-    window[HANDLE] = bridge;
-    return bridge;
+    Connection.prototype.serverconnect = function (server, roomPacket) {
+      this.pendingConnect = roomPacket;
+      bot.status = 'connecting';
+      bot.lastError = null;
+      notify();
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+        this.socket.send(41);
+        this.socket.send(40);
+      } else {
+        this.open(server);
+      }
+      this.onrequest = () => {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN && this.pendingConnect) {
+          this.socket.send(this.pendingConnect);
+        }
+      };
+    };
+
+    const Room = function (conn) {
+      this.conn = conn;
+      this.id = null;
+      this.players = [];
+    };
+
+    Room.prototype.join = function (invite, joinOptions = {}) {
+      const joinSettings = {
+        allowRandom: bot.allowRandom,
+        ...joinOptions,
+      };
+      const rawInvite = typeof invite === 'string' ? invite : '';
+      const clean = rawInvite.trim();
+      bot.invite = clean;
+      let server = '';
+      let gamemode = 1;
+
+      if (!clean && !joinSettings.allowRandom) {
+        bot.status = 'error';
+        bot.lastError = 'Provide a room invite before connecting the bot.';
+        notify();
+        return;
+      }
+
+      if (clean) {
+        const code = clean.startsWith('http') ? clean.split('/').pop() : clean;
+        this.id = code;
+        if (clean.endsWith('.3')) {
+          server = 'sv3.';
+          gamemode = 2;
+        } else if (clean.endsWith('.2')) {
+          server = 'sv2.';
+          gamemode = 2;
+        } else {
+          server = '';
+          gamemode = 1;
+        }
+      } else {
+        this.id = null;
+        server = 'sv3.';
+        gamemode = 2;
+      }
+
+      const serverUrl = `wss://${server}drawaria.online/socket.io/?sid1=undefined&hostname=drawaria.online&EIO=3&transport=websocket`;
+      const player = this.conn.player;
+      player.annonymize(bot.name);
+      this.players = [];
+      const payload = `420["startplay","${player.name}",${gamemode},"en",${nullify(this.id)},null,[null,"https://drawaria.online/",1000,1000,[${nullify(player.sid1)},${nullify(player.uid)},${nullify(player.wt)}],null]]`;
+      this.conn.serverconnect(serverUrl, payload);
+      notify();
+    };
+
+    Room.prototype.leave = function () {
+      bot.status = 'idle';
+      bot.lastError = null;
+      this.players = [];
+      this.id = null;
+      this.conn.close(1000, 'bot leave');
+      notify();
+    };
+
+    Room.prototype.next = function () {
+      if (!bot.allowRandom) {
+        bot.lastError = 'Random hopping is available for scout bots only.';
+        notify();
+        return;
+      }
+      if (this.conn.socket && this.conn.socket.readyState === WebSocket.OPEN) {
+        bot.status = 'connecting';
+        notify();
+        this.conn.socket.send('42["pgswtichroom"]');
+      }
+    };
+
+    const Actions = function (conn) {
+      this.conn = conn;
+    };
+
+    Actions.prototype.DrawLine = function (bx = 50, by = 50, ex = 50, ey = 50, thickness = 50, color = '#FFFFFF', algo = 0) {
+      if (!this.conn.socket || this.conn.socket.readyState !== WebSocket.OPEN) return;
+      const startX = (bx / 100).toFixed(4);
+      const startY = (by / 100).toFixed(4);
+      const endX = (ex / 100).toFixed(4);
+      const endY = (ey / 100).toFixed(4);
+      const payload = `42["drawcmd",0,[${startX},${startY},${endX},${endY},true,${-thickness},"${color}",0,0,{"2":${algo},"3":0.5,"4":0.5}]]`;
+      const payload2 = `42["drawcmd",0,[${startX},${startY},${endX},${endY},false,${-thickness},"${color}",0,0,{"2":${algo},"3":0.5,"4":0.5}]]`;
+      this.conn.socket.send(payload);
+      this.conn.socket.send(payload2);
+    };
+
+    const Player = function (name = undefined) {
+      this.name = name;
+      this.sid1 = null;
+      this.uid = '';
+      this.wt = '';
+      this.conn = new Connection(this);
+      this.room = new Room(this.conn);
+      this.action = new Actions(this.conn);
+    };
+
+    Player.prototype.annonymize = function (name) {
+      this.name = name;
+      this.uid = undefined;
+      this.wt = undefined;
+    };
+
+    bot.player = new Player(bot.name);
+    bot.room = bot.player.room;
+    bot.actions = bot.player.action;
+
+    if (bot.primary) {
+      window.__drawariaOmniBot = bot;
+    }
+
+    notify();
+
+    return bot;
   }
+
+  function hslToRgb(h, s, l) {
+    const hue = ((h % 360) + 360) % 360;
+    const sat = clamp(s, 0, 1);
+    const lig = clamp(l, 0, 1);
+    if (sat === 0) {
+      const v = Math.round(lig * 255);
+      return { r: v, g: v, b: v, a: 1 };
+    }
+    const c = (1 - Math.abs(2 * lig - 1)) * sat;
+    const hp = hue / 60;
+    const x = c * (1 - Math.abs((hp % 2) - 1));
+    let r1 = 0;
+    let g1 = 0;
+    let b1 = 0;
+    if (hp >= 0 && hp < 1) {
+      r1 = c;
+      g1 = x;
+    } else if (hp >= 1 && hp < 2) {
+      r1 = x;
+      g1 = c;
+    } else if (hp >= 2 && hp < 3) {
+      g1 = c;
+      b1 = x;
+    } else if (hp >= 3 && hp < 4) {
+      g1 = x;
+      b1 = c;
+    } else if (hp >= 4 && hp < 5) {
+      r1 = x;
+      b1 = c;
+    } else {
+      r1 = c;
+      b1 = x;
+    }
+    const m = lig - c / 2;
+    return {
+      r: Math.round((r1 + m) * 255),
+      g: Math.round((g1 + m) * 255),
+      b: Math.round((b1 + m) * 255),
+      a: 1,
+    };
+  }
+
+  function parseCssColor(value) {
+    if (!value) return null;
+    const str = value.trim().toLowerCase();
+    if (!str) return null;
+    if (str.startsWith('#')) {
+      const hex = str.slice(1);
+      if (hex.length === 3) {
+        const r = parseInt(hex[0] + hex[0], 16);
+        const g = parseInt(hex[1] + hex[1], 16);
+        const b = parseInt(hex[2] + hex[2], 16);
+        return { r, g, b, a: 1 };
+      }
+      if (hex.length === 6 || hex.length === 8) {
+        const r = parseInt(hex.slice(0, 2), 16);
+        const g = parseInt(hex.slice(2, 4), 16);
+        const b = parseInt(hex.slice(4, 6), 16);
+        const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
+        return { r, g, b, a };
+      }
+      return null;
+    }
+    if (str.startsWith('rgb')) {
+      const nums = str
+        .replace(/rgba?\(/, '')
+        .replace(')', '')
+        .split(',')
+        .map((part) => part.trim());
+      if (nums.length < 3) return null;
+      const r = parseFloat(nums[0]);
+      const g = parseFloat(nums[1]);
+      const b = parseFloat(nums[2]);
+      const a = nums[3] !== undefined ? parseFloat(nums[3]) : 1;
+      if ([r, g, b, a].some((num) => Number.isNaN(num))) return null;
+      return { r, g, b, a };
+    }
+    if (str.startsWith('hsl')) {
+      const nums = str
+        .replace(/hsla?\(/, '')
+        .replace(')', '')
+        .split(',')
+        .map((part) => part.trim());
+      if (nums.length < 3) return null;
+      const h = parseFloat(nums[0]);
+      const s = parseFloat(nums[1].replace('%', '')) / 100;
+      const l = parseFloat(nums[2].replace('%', '')) / 100;
+      const a = nums[3] !== undefined ? parseFloat(nums[3]) : 1;
+      if ([h, s, l, a].some((num) => Number.isNaN(num))) return null;
+      const rgb = hslToRgb(h, s, l);
+      rgb.a = a;
+      return rgb;
+    }
+    return null;
+  }
+
+  function componentToHex(component) {
+    const clamped = Math.max(0, Math.min(255, Math.round(component)));
+    return clamped.toString(16).padStart(2, '0');
+  }
+
+  function rgbToHex(rgb) {
+    if (!rgb) return null;
+    return `#${componentToHex(rgb.r)}${componentToHex(rgb.g)}${componentToHex(rgb.b)}`;
+  }
+
+  function normalizeHex(value) {
+    const rgb = parseCssColor(value);
+    return rgb ? rgbToHex(rgb) : null;
+  }
+
+  function colorDistance(a, b) {
+    if (!a || !b) return Number.POSITIVE_INFINITY;
+    const dr = a.r - b.r;
+    const dg = a.g - b.g;
+    const db = a.b - b.b;
+    return Math.sqrt(dr * dr + dg * dg + db * db);
+  }
+
+  function adjustLightness(rgb, amount) {
+    if (!rgb) return rgb;
+    if (!amount) return { ...rgb };
+    const factor = clamp(amount / 100, -1, 1);
+    if (factor === 0) return { ...rgb };
+    if (factor > 0) {
+      return {
+        r: Math.round(rgb.r + (255 - rgb.r) * factor),
+        g: Math.round(rgb.g + (255 - rgb.g) * factor),
+        b: Math.round(rgb.b + (255 - rgb.b) * factor),
+        a: rgb.a,
+      };
+    }
+    return {
+      r: Math.round(rgb.r * (1 + factor)),
+      g: Math.round(rgb.g * (1 + factor)),
+      b: Math.round(rgb.b * (1 + factor)),
+      a: rgb.a,
+    };
+  }
+
+  function isElementVisible(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function extractPaletteColor(el) {
+    if (!el || !(el instanceof HTMLElement)) return null;
+    const datasetColor = el.dataset ? (el.dataset.color || el.dataset.value) : null;
+    const attrColor = datasetColor || el.getAttribute('data-color') || el.getAttribute('value');
+    if (attrColor) {
+      const parsed = parseCssColor(attrColor);
+      if (parsed) {
+        return { rgb: parsed, hex: rgbToHex(parsed) };
+      }
+    }
+
+    const style = window.getComputedStyle(el);
+    const candidates = [style.backgroundColor, style.borderTopColor, style.borderLeftColor, style.color];
+    for (const candidate of candidates) {
+      const parsed = parseCssColor(candidate);
+      if (parsed && parsed.a > 0.6) {
+        return { rgb: parsed, hex: rgbToHex(parsed) };
+      }
+    }
+    return null;
+  }
+
+  function scanPalette() {
+    const seen = new Set();
+    const results = [];
+    const selectors = [
+      '[data-color]',
+      '[aria-label*="color" i]',
+      'button[style*="background"]',
+      'div[style*="background"]',
+      'span[style*="background"]',
+      'button',
+      '[role="button"]',
+      '[role="radio"]',
+    ];
+    const elements = new Set();
+    selectors.forEach((selector) => {
+      document.querySelectorAll(selector).forEach((el) => {
+        if (el instanceof HTMLElement) {
+          elements.add(el);
+        }
+      });
+    });
+
+    elements.forEach((el) => {
+      if (el === state.panel || !el.isConnected) return;
+      if (state.panel && (el.contains(state.panel) || state.panel.contains(el))) return;
+      if (!isElementVisible(el)) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 14 || rect.width > 72 || rect.height < 14 || rect.height > 72) return;
+      if (el.closest('canvas')) return;
+      const colorInfo = extractPaletteColor(el);
+      if (!colorInfo) return;
+      const key = `${colorInfo.hex}|${Math.round(rect.left)}|${Math.round(rect.top)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      results.push({
+        el,
+        hex: colorInfo.hex,
+        rgb: colorInfo.rgb,
+      });
+    });
+
+    return results;
+  }
+
+  function detectActiveSwatch(palette) {
+    const activeAttributes = ['aria-pressed', 'aria-selected', 'data-selected', 'data-active'];
+    for (const entry of palette) {
+      const el = entry.el;
+      if (!el || !el.isConnected) continue;
+      for (const attr of activeAttributes) {
+        if (el.getAttribute && el.getAttribute(attr) === 'true') {
+          return entry;
+        }
+      }
+      const className = typeof el.className === 'string' ? el.className : '';
+      if (/(active|selected|current|checked)/i.test(className)) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
+  function findPaletteMatch(targetHex, palette) {
+    const targetRgb = parseCssColor(targetHex);
+    if (!targetRgb) return null;
+    let best = null;
+    for (const entry of palette) {
+      const diff = colorDistance(targetRgb, entry.rgb);
+      if (!best || diff < best.diff) {
+        best = { ...entry, diff };
+      }
+    }
+    return best;
+  }
+
+  async function activateSwatch(entry) {
+    if (!entry || !entry.el || !entry.el.isConnected) {
+      return false;
+    }
+    const el = entry.el;
+    const rect = el.getBoundingClientRect();
+    const point = {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+    try {
+      const pointerDown = new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        pointerId: state.palettePointerId,
+        pointerType: 'mouse',
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+        buttons: 1,
+        pressure: 0.5,
+      });
+      const pointerUp = new PointerEvent('pointerup', {
+        bubbles: true,
+        cancelable: true,
+        pointerId: state.palettePointerId,
+        pointerType: 'mouse',
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+        buttons: 0,
+        pressure: 0,
+      });
+      const mouseClick = new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+      });
+      el.dispatchEvent(pointerDown);
+      el.dispatchEvent(pointerUp);
+      el.dispatchEvent(mouseClick);
+      await delay(32);
+      return true;
+    } catch (err) {
+      console.warn('Drawaria OmniDraw: failed to activate color swatch', err);
+      return false;
+    }
+  }
+
+  async function ensureColor(hex, attempt = 0) {
+    if (!hex) return true;
+    const normalized = normalizeHex(hex);
+    if (!normalized) return false;
+
+    if (!state.palette || !state.palette.length || attempt > 0) {
+      state.palette = scanPalette();
+      if (!state.palette.length) {
+        return false;
+      }
+      if (!state.initialColorHex) {
+        const active = detectActiveSwatch(state.palette);
+        if (active) {
+          state.initialColorHex = active.hex;
+          state.currentSwatch = active.el;
+        }
+      }
+      state.colorCache.clear();
+    }
+
+    if (!state.colorCache.has(normalized)) {
+      const match = findPaletteMatch(normalized, state.palette);
+      state.colorCache.set(normalized, match || null);
+    }
+
+    const entry = state.colorCache.get(normalized);
+    if (!entry) {
+      if (attempt === 0) {
+        return ensureColor(hex, attempt + 1);
+      }
+      return false;
+    }
+
+    if (!entry.el.isConnected) {
+      if (attempt === 0) {
+        state.colorCache.delete(normalized);
+        return ensureColor(hex, attempt + 1);
+      }
+      return false;
+    }
+
+    if (state.currentSwatch === entry.el) {
+      return true;
+    }
+
+    const ok = await activateSwatch(entry);
+    if (ok) {
+      state.currentSwatch = entry.el;
+    }
+    return ok;
+  }
+
+
+  async function restoreInitialColor() {
+    if (!state.initialColorHex) {
+      return;
+    }
+    await ensureColor(state.initialColorHex, 1);
+  }
+
+  function findDrawingCanvas() {
+    const candidates = Array.from(document.querySelectorAll('canvas'))
+      .map((el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          el,
+          rect,
+          area: Math.round(rect.width * rect.height),
+          visible: rect.width > 0 && rect.height > 0,
+          style: window.getComputedStyle(el),
+        };
+      })
+      .filter((entry) => entry.visible && entry.area > 160000 && entry.style.pointerEvents !== 'none');
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    candidates.sort((a, b) => b.area - a.area);
+    return candidates[0].el;
+  }
+
+  const canvas = findDrawingCanvas();
+  if (!canvas) {
+    alert('Drawaria OmniDraw: join a drawing room before running this helper.');
+    return;
+  }
+  state.canvas = canvas;
+
+  function injectStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+      .drawaria-omni-root {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 999999;
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+      }
+      .drawaria-omni-panel {
+        position: absolute;
+        top: 28px;
+        left: 28px;
+        width: min(480px, calc(100vw - 56px));
+        max-height: min(82vh, 720px);
+        height: clamp(520px, 70vh, 680px);
+        color: #0f172a;
+        background: linear-gradient(155deg, rgba(255, 255, 255, 0.96), rgba(236, 243, 255, 0.94));
+        border-radius: 26px;
+        box-shadow: 0 34px 80px rgba(15, 23, 42, 0.34);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        backdrop-filter: blur(26px);
+        pointer-events: auto;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        isolation: isolate;
+      }
+      .drawaria-omni-panel::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: radial-gradient(circle at top right, rgba(96, 165, 250, 0.28), transparent 55%), radial-gradient(circle at bottom left, rgba(167, 139, 250, 0.32), transparent 45%);
+        pointer-events: none;
+        opacity: 0.85;
+      }
+      .drawaria-omni-panel > * {
+        position: relative;
+        z-index: 1;
+      }
+      .drawaria-omni-panel.minimized {
+        height: auto;
+        max-height: none;
+      }
+      .drawaria-omni-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 20px 24px 16px;
+        background: linear-gradient(135deg, rgba(59, 130, 246, 0.42), rgba(147, 197, 253, 0.24));
+        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+        cursor: grab;
+        user-select: none;
+      }
+      .drawaria-omni-title {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .drawaria-omni-title strong {
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        font-size: 17px;
+      }
+      .drawaria-omni-title span {
+        font-size: 12px;
+        color: rgba(15, 23, 42, 0.7);
+        letter-spacing: 0.2px;
+      }
+      .drawaria-omni-header button {
+        border: none;
+        background: rgba(255, 255, 255, 0.95);
+        color: #1d4ed8;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        font-size: 18px;
+        font-weight: 600;
+        display: grid;
+        place-items: center;
+        box-shadow: 0 14px 32px rgba(37, 99, 235, 0.24);
+        cursor: pointer;
+        transition: transform 140ms ease, box-shadow 140ms ease;
+      }
+      .drawaria-omni-header button[data-action="close"] {
+        color: #dc2626;
+        box-shadow: 0 12px 30px rgba(220, 38, 38, 0.22);
+      }
+      .drawaria-omni-header button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 16px 36px rgba(15, 23, 42, 0.24);
+      }
+      .drawaria-omni-header button:active {
+        transform: translateY(1px) scale(0.96);
+      }
+      .drawaria-omni-tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 14px 26px 10px;
+        background: linear-gradient(135deg, rgba(248, 250, 252, 0.9), rgba(226, 232, 240, 0.76));
+        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+        backdrop-filter: blur(8px);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.64);
+      }
+      .drawaria-omni-tabbtn {
+        position: relative;
+        border: none;
+        border-radius: 16px;
+        padding: 11px 16px;
+        background: linear-gradient(145deg, rgba(255, 255, 255, 0.94), rgba(226, 232, 240, 0.78));
+        color: #1e293b;
+        font-weight: 600;
+        font-size: 13.5px;
+        letter-spacing: 0.2px;
+        cursor: pointer;
+        box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.7), 0 14px 22px rgba(148, 163, 184, 0.2);
+        transition: transform 120ms ease, box-shadow 160ms ease, color 150ms ease;
+        min-width: 102px;
+      }
+      .drawaria-omni-tabbtn.active {
+        color: #1d4ed8;
+        box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.32), 0 14px 26px rgba(59, 130, 246, 0.28);
+        transform: translateY(-1px);
+      }
+      .drawaria-omni-tabbtn::after {
+        content: '';
+        position: absolute;
+        inset-inline: 18px;
+        bottom: 6px;
+        height: 2px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(59, 130, 246, 0.6), rgba(147, 197, 253, 0.4));
+        opacity: 0;
+        transition: opacity 160ms ease;
+      }
+      .drawaria-omni-tabbtn.active::after {
+        opacity: 1;
+      }
+      .drawaria-omni-panel.minimized .drawaria-omni-tabs,
+      .drawaria-omni-panel.minimized .drawaria-omni-content,
+      .drawaria-omni-panel.minimized .drawaria-omni-footer {
+        display: none;
+      }
+      .drawaria-omni-content {
+        padding: 22px 28px 24px;
+        flex: 1;
+        display: flex;
+        position: relative;
+        overflow: hidden;
+        height: calc(100% - 180px);
+      }
+      .drawaria-omni-tab {
+        display: none;
+        overflow-y: auto;
+        padding-right: 10px;
+        margin-right: -4px;
+        height: 100%;
+        width: 100%;
+      }
+      .drawaria-omni-tab::-webkit-scrollbar {
+        width: 8px;
+      }
+      .drawaria-omni-tab::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.5);
+        border-radius: 999px;
+      }
+      .drawaria-omni-tab::-webkit-scrollbar-track {
+        background: rgba(148, 163, 184, 0.1);
+        border-radius: 999px;
+      }
+      .drawaria-omni-tab.active {
+        display: block;
+        flex: 1 1 auto;
+      }
+      .drawaria-omni-section {
+        display: grid;
+        gap: 20px;
+        margin-bottom: 24px;
+        padding: 24px 22px 26px;
+        border-radius: 20px;
+        border: 1.5px solid rgba(148, 163, 184, 0.25);
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+      }
+      .drawaria-omni-section:last-of-type {
+        border-bottom: none;
+        margin-bottom: 0;
+        padding-bottom: 22px;
+      }
+      .drawaria-omni-section h3 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+        color: #1f2937;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+        padding-bottom: 12px;
+      }
+      .drawaria-omni-field {
+        display: grid;
+        gap: 10px;
+      }
+      .drawaria-omni-field label {
+        font-size: 15px;
+        font-weight: 600;
+        color: #111827;
+      }
+      .drawaria-omni-field input[type="number"],
+      .drawaria-omni-field input[type="text"],
+      .drawaria-omni-field input[type="range"],
+      .drawaria-omni-field select,
+      .drawaria-omni-field textarea {
+        width: 100%;
+        padding: 14px 16px;
+        border-radius: 14px;
+        border: 1.5px solid rgba(148, 163, 184, 0.45);
+        font-size: 15px;
+        background: rgba(255, 255, 255, 0.97);
+        box-shadow: inset 0 2px 4px rgba(15, 23, 42, 0.08);
+        color: #0f172a;
+        line-height: 1.4;
+      }
+      .drawaria-omni-field textarea {
+        resize: vertical;
+        min-height: 100px;
+        max-height: 220px;
+      }
+      .drawaria-omni-field small {
+        font-size: 13px;
+        color: rgba(30, 41, 59, 0.78);
+        line-height: 1.5;
+      }
+      .drawaria-omni-field input[type="range"] {
+        padding: 0;
+        height: 6px;
+        accent-color: #3b82f6;
+      }
+      .drawaria-omni-upload {
+        display: grid;
+        gap: 12px;
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(59, 130, 246, 0.1);
+        border: 2px dashed rgba(59, 130, 246, 0.4);
+      }
+      .drawaria-omni-upload strong {
+        font-size: 14px;
+        font-weight: 600;
+        color: #1d4ed8;
+      }
+      .drawaria-omni-upload input[type="file"] {
+        font-size: 14px;
+      }
+      .drawaria-omni-preview-box {
+        position: relative;
+        border-radius: 18px;
+        overflow: hidden;
+        background: rgba(15, 23, 42, 0.08);
+        border: 1.5px solid rgba(148, 163, 184, 0.22);
+        min-height: 280px;
+        display: grid;
+        place-items: center;
+      }
+      .drawaria-omni-preview-box canvas {
+        max-width: 100%;
+        height: auto;
+        border-radius: 12px;
+      }
+      .drawaria-omni-preview-controls {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        margin-top: 14px;
+        width: 100%;
+      }
+      .drawaria-omni-button {
+        border: none;
+        padding: 12px 18px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #2563eb, #7c3aed);
+        color: #ffffff;
+        font-weight: 600;
+        font-size: 14px;
+        letter-spacing: 0.3px;
+        cursor: pointer;
+        box-shadow: 0 14px 24px rgba(37, 99, 235, 0.32);
+        transition: transform 120ms ease, box-shadow 150ms ease, filter 150ms ease;
+      }
+      .drawaria-omni-button.secondary {
+        background: rgba(15, 23, 42, 0.12);
+        color: #0f172a;
+        box-shadow: none;
+      }
+      .drawaria-omni-button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+        box-shadow: none;
+      }
+      .drawaria-omni-button:not(:disabled):hover {
+        transform: translateY(-1px);
+        box-shadow: 0 18px 32px rgba(37, 99, 235, 0.35);
+      }
+      .drawaria-omni-button:not(:disabled):active {
+        transform: translateY(1px) scale(0.97);
+      }
+      .drawaria-omni-footer {
+        padding: 22px 24px 24px;
+        background: linear-gradient(135deg, rgba(248, 250, 252, 0.9), rgba(236, 233, 254, 0.75));
+        border-top: 1.5px solid rgba(148, 163, 184, 0.18);
+        display: grid;
+        gap: 18px;
+      }
+      .drawaria-omni-progress {
+        display: grid;
+        gap: 8px;
+      }
+      .drawaria-omni-progress span {
+        font-size: 13px;
+        color: rgba(15, 23, 42, 0.8);
+        letter-spacing: 0.3px;
+        font-weight: 600;
+      }
+      .drawaria-omni-conn {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: rgba(15, 23, 42, 0.75);
+        letter-spacing: 0.25px;
+        font-weight: 600;
+      }
+      .drawaria-omni-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: rgba(148, 163, 184, 0.8);
+        box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.2);
+      }
+      .drawaria-omni-dot.online {
+        background: rgba(34, 197, 94, 0.9);
+        box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
+      }
+      .drawaria-omni-dot.pending {
+        background: rgba(251, 191, 36, 0.9);
+        box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.2);
+      }
+      .drawaria-omni-dot.offline {
+        background: rgba(148, 163, 184, 0.9);
+        box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.25);
+      }
+      .drawaria-omni-progress-bar {
+        position: relative;
+        width: 100%;
+        height: 12px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.22);
+        overflow: hidden;
+      }
+      .drawaria-omni-progress-bar::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        width: var(--progress, 0%);
+        background: linear-gradient(90deg, rgba(37, 99, 235, 0.9), rgba(192, 132, 252, 0.9));
+        transition: width 200ms ease;
+      }
+      .drawaria-omni-actions {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .drawaria-omni-actions .drawaria-omni-button {
+        flex: 1 1 140px;
+      }
+      .drawaria-omni-stats {
+        display: grid;
+        gap: 12px;
+        font-size: 14px;
+        line-height: 1.5;
+        color: rgba(15, 23, 42, 0.82);
+      }
+      .drawaria-omni-note {
+        font-size: 14px;
+        color: rgba(30, 41, 59, 0.78);
+        line-height: 1.5;
+      }
+      .drawaria-omni-fleet {
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(59, 130, 246, 0.1);
+        border: 1.5px solid rgba(96, 165, 250, 0.3);
+      }
+      .drawaria-omni-fleet-item {
+        display: grid;
+        gap: 8px;
+        padding: 14px 16px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.94);
+        border: 1.5px solid rgba(148, 163, 184, 0.25);
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+      }
+      .drawaria-omni-fleet-item strong {
+        font-size: 14px;
+        color: #1d4ed8;
+      }
+      .drawaria-omni-fleet-actions {
+        display: flex;
+        gap: 12px;
+      }
+      .drawaria-omni-fleet-actions button {
+        flex: 1 1 auto;
+        border: none;
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-weight: 600;
+        cursor: pointer;
+        background: linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(129, 140, 248, 0.2));
+        color: #1f2937;
+        box-shadow: 0 2px 6px rgba(59, 130, 246, 0.15);
+        transition: transform 120ms ease, box-shadow 160ms ease;
+      }
+      .drawaria-omni-fleet-actions button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 10px 20px rgba(59, 130, 246, 0.18);
+      }
+      @media (max-width: 720px) {
+        .drawaria-omni-panel {
+          width: calc(100vw - 32px);
+          left: 16px;
+        }
+      }
+    `;
+    document.head.appendChild(style);
+    state.style = style;
+  }
+
+  function createRoot() {
+    const root = document.createElement('div');
+    root.className = 'drawaria-omni-root';
+    document.body.appendChild(root);
+    state.root = root;
+  }
+
+  function createHeader(panel) {
+    const header = document.createElement('div');
+    header.className = 'drawaria-omni-header';
+
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'drawaria-omni-title';
+    const title = document.createElement('strong');
+    title.textContent = 'OmniDraw Studio';
+    const subtitle = document.createElement('span');
+    subtitle.textContent = 'Autodraw anything at 650px precision';
+    titleWrap.append(title, subtitle);
+
+    const controls = document.createElement('div');
+    const minimizeBtn = document.createElement('button');
+    minimizeBtn.textContent = '–';
+    minimizeBtn.title = 'Minimize panel';
+    minimizeBtn.dataset.action = 'minimize';
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    closeBtn.title = 'Close helper';
+    closeBtn.dataset.action = 'close';
+    controls.append(minimizeBtn, closeBtn);
+
+    header.append(titleWrap, controls);
+
+    const onPointerDown = (event) => {
+      if (event.target instanceof HTMLElement && event.target.tagName === 'BUTTON') {
+        return;
+      }
+      const rect = panel.getBoundingClientRect();
+      state.drag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+      };
+      header.setPointerCapture(event.pointerId);
+      header.style.cursor = 'grabbing';
+    };
+
+    const onPointerMove = (event) => {
+      if (!state.drag || state.drag.pointerId !== event.pointerId) return;
+      const left = event.clientX - state.drag.offsetX;
+      const top = event.clientY - state.drag.offsetY;
+      panel.style.left = `${clamp(left, -panel.offsetWidth * 0.5, window.innerWidth - panel.offsetWidth * 0.4)}px`;
+      panel.style.top = `${clamp(top, 8, window.innerHeight - 72)}px`;
+    };
+
+    const onPointerUp = (event) => {
+      if (!state.drag || state.drag.pointerId !== event.pointerId) return;
+      header.releasePointerCapture(event.pointerId);
+      state.drag = null;
+      header.style.cursor = 'grab';
+    };
+
+    header.addEventListener('pointerdown', onPointerDown);
+    header.addEventListener('pointermove', onPointerMove);
+    header.addEventListener('pointerup', onPointerUp);
+    header.addEventListener('lostpointercapture', () => {
+      state.drag = null;
+      header.style.cursor = 'grab';
+    });
+
+    minimizeBtn.addEventListener('click', () => {
+      panel.classList.toggle('minimized');
+    });
+    closeBtn.addEventListener('click', () => {
+      destroy();
+    });
+
+    return header;
+  }
+
+  function createTabs(panel) {
+    const tabs = [
+      { id: 'image', label: 'Image' },
+      { id: 'path', label: 'Path' },
+      { id: 'bot', label: 'Bot' },
+      { id: 'placement', label: 'Placement' },
+      { id: 'preview', label: 'Preview' },
+      { id: 'guide', label: 'Guide' },
+    ];
+
+    const tabBar = document.createElement('div');
+    tabBar.className = 'drawaria-omni-tabs';
+
+    const contentWrap = document.createElement('div');
+    contentWrap.className = 'drawaria-omni-content';
+
+    const tabButtons = new Map();
+
+    const setActiveTab = (id) => {
+      state.activeTab = id;
+      tabButtons.forEach((btn, tabId) => {
+        btn.classList.toggle('active', tabId === id);
+      });
+      state.tabs.forEach((tabEl, tabId) => {
+        tabEl.classList.toggle('active', tabId === id);
+      });
+    };
+
+    tabs.forEach((tab) => {
+      const btn = document.createElement('button');
+      btn.className = 'drawaria-omni-tabbtn';
+      btn.type = 'button';
+      btn.textContent = tab.label;
+      btn.addEventListener('click', () => setActiveTab(tab.id));
+      tabButtons.set(tab.id, btn);
+      tabBar.appendChild(btn);
+
+      const tabEl = document.createElement('div');
+      tabEl.className = 'drawaria-omni-tab';
+      state.tabs.set(tab.id, tabEl);
+      contentWrap.appendChild(tabEl);
+    });
+
+    setActiveTab(state.activeTab);
+
+    return { tabBar, contentWrap };
+  }
+
+  async function handleFileSelection(files) {
+    if (!files || !files.length) return;
+    const file = files[0];
+    try {
+      const bitmap = await createImageBitmap(file);
+      await loadImageBitmap(bitmap, file.name || 'uploaded image');
+    } catch (err) {
+      console.error('OmniDraw failed to read image', err);
+      alert('Could not read that file. Try a standard image such as PNG or JPEG.');
+    }
+  }
+
+  async function handleImageUrl(url) {
+    if (!url) return;
+    try {
+      const response = await fetch(url, { mode: 'cors' });
+      const blob = await response.blob();
+      const bitmap = await createImageBitmap(blob);
+      await loadImageBitmap(bitmap, url);
+    } catch (err) {
+      console.error('OmniDraw failed to fetch image', err);
+      alert('Could not load that link. Make sure it is an image URL that allows cross-origin access.');
+    }
+  }
+
+  function fitBitmapToResolution(bitmap) {
+    const target = state.config.resolution;
+    const aspect = bitmap.width / bitmap.height;
+    let width = target;
+    let height = Math.round(target / aspect);
+    if (height > target) {
+      height = target;
+      width = Math.round(target * aspect);
+    }
+    const offscreen = document.createElement('canvas');
+    offscreen.width = width;
+    offscreen.height = height;
+    const ctx = offscreen.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    const baseData = ctx.getImageData(0, 0, width, height);
+    return {
+      width,
+      height,
+      baseData,
+    };
+  }
+
+  function cloneImageData(imageData) {
+    return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+  }
+
+  function lightenImageData(baseData, amount) {
+    const copy = cloneImageData(baseData);
+    if (!amount) {
+      return copy;
+    }
+    const data = copy.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const rgb = { r: data[i], g: data[i + 1], b: data[i + 2], a: data[i + 3] / 255 };
+      const adjusted = adjustLightness(rgb, amount);
+      data[i] = adjusted.r;
+      data[i + 1] = adjusted.g;
+      data[i + 2] = adjusted.b;
+    }
+    return copy;
+  }
+
+  async function loadImageBitmap(bitmap, label = 'image') {
+    const fitted = fitBitmapToResolution(bitmap);
+    const adjusted = lightenImageData(fitted.baseData, state.config.lighten);
+    state.image = {
+      label,
+      width: fitted.width,
+      height: fitted.height,
+      baseData: cloneImageData(fitted.baseData),
+      data: adjusted,
+    };
+    updateImageInfo();
+    await buildCommands();
+    renderPreview(state.preview.drawnSegments);
+  }
+
+  function createFieldNumber({ label, min, max, step, get, set, description, onChange }) {
+    const handler = onChange === undefined ? handleSettingsChange : onChange;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'drawaria-omni-field';
+    const title = document.createElement('label');
+    title.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'number';
+    if (min !== undefined) input.min = String(min);
+    if (max !== undefined) input.max = String(max);
+    if (step !== undefined) input.step = String(step);
+    input.value = String(get());
+    input.addEventListener('change', () => {
+      const value = parseFloat(input.value);
+      if (Number.isFinite(value)) {
+        set(clamp(value, min ?? value, max ?? value));
+        input.value = String(get());
+        if (handler) handler(get());
+      } else {
+        input.value = String(get());
+      }
+    });
+    wrapper.append(title, input);
+    if (description) {
+      const note = document.createElement('small');
+      note.textContent = description;
+      wrapper.appendChild(note);
+    }
+    return wrapper;
+  }
+
+  function createFieldRange({ label, min, max, step, unit = '', get, set, description, onChange, formatValue }) {
+    const handler = onChange === undefined ? handleSettingsChange : onChange;
+    const format = formatValue || ((value) => {
+      if (Number.isInteger(value)) return String(value);
+      return value.toFixed(2).replace(/\.00$/, '');
+    });
+    const wrapper = document.createElement('div');
+    wrapper.className = 'drawaria-omni-field';
+    const title = document.createElement('label');
+    const updateLabel = () => {
+      title.textContent = `${label} (${format(get())}${unit})`;
+    };
+    updateLabel();
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = String(min);
+    input.max = String(max);
+    input.step = step ? String(step) : '1';
+    input.value = String(get());
+    input.addEventListener('input', () => {
+      const value = parseFloat(input.value);
+      if (Number.isFinite(value)) {
+        set(value);
+        updateLabel();
+        if (handler) handler(get());
+      }
+    });
+    wrapper.append(title, input);
+    if (description) {
+      const note = document.createElement('small');
+      note.textContent = description;
+      wrapper.appendChild(note);
+    }
+    return wrapper;
+  }
+
+  function createFieldSelect({ label, options, get, set, description, onChange }) {
+    const handler = onChange === undefined ? handleSettingsChange : onChange;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'drawaria-omni-field';
+    const title = document.createElement('label');
+    title.textContent = label;
+    const select = document.createElement('select');
+    options.forEach((opt) => {
+      const option = document.createElement('option');
+      option.value = opt.value;
+      option.textContent = opt.label;
+      if (opt.value === get()) {
+        option.selected = true;
+      }
+      select.appendChild(option);
+    });
+    select.addEventListener('change', () => {
+      set(select.value);
+      if (handler) handler(get());
+    });
+    wrapper.append(title, select);
+    if (description) {
+      const note = document.createElement('small');
+      note.textContent = description;
+      wrapper.appendChild(note);
+    }
+    return wrapper;
+  }
+
+  function updateLightnessAndRebuild(value) {
+    state.config.lighten = clamp(value, -40, 60);
+    if (!state.image || state.drawing) {
+      return;
+    }
+    state.image.data = lightenImageData(state.image.baseData, state.config.lighten);
+    handleSettingsChange();
+  }
+
+  function buildImageTab(tab) {
+    tab.innerHTML = '';
+    const sectionLoad = document.createElement('div');
+    sectionLoad.className = 'drawaria-omni-section';
+    const loadTitle = document.createElement('h3');
+    loadTitle.textContent = 'Add your picture';
+    const uploadBox = document.createElement('div');
+    uploadBox.className = 'drawaria-omni-upload';
+    const uploadLabel = document.createElement('strong');
+    uploadLabel.textContent = 'Drop or choose an image (PNG, JPG, WebP).';
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'image/*';
+    fileInput.addEventListener('change', () => handleFileSelection(fileInput.files));
+    uploadBox.append(uploadLabel, fileInput);
+
+    const urlField = document.createElement('div');
+    urlField.className = 'drawaria-omni-field';
+    const urlLabel = document.createElement('label');
+    urlLabel.textContent = 'Image link';
+    const urlInput = document.createElement('input');
+    urlInput.type = 'text';
+    urlInput.placeholder = 'https://example.com/art.png';
+    const urlButton = document.createElement('button');
+    urlButton.className = 'drawaria-omni-button secondary';
+    urlButton.type = 'button';
+    urlButton.textContent = 'Load link';
+    urlButton.addEventListener('click', () => {
+      const value = urlInput.value.trim();
+      if (value) {
+        handleImageUrl(value);
+      }
+    });
+    const urlRow = document.createElement('div');
+    urlRow.style.display = 'grid';
+    urlRow.style.gridTemplateColumns = '1fr auto';
+    urlRow.style.gap = '10px';
+    urlRow.append(urlInput, urlButton);
+    const urlHint = document.createElement('small');
+    urlHint.textContent = 'Images are scaled to 650px for crisp 1px strokes.';
+    urlField.append(urlLabel, urlRow, urlHint);
+
+    const adjustSection = document.createElement('div');
+    adjustSection.className = 'drawaria-omni-field';
+    const lightenLabel = document.createElement('label');
+    lightenLabel.textContent = `Light boost (${state.config.lighten})`;
+    const lightenRange = document.createElement('input');
+    lightenRange.type = 'range';
+    lightenRange.min = '-40';
+    lightenRange.max = '60';
+    lightenRange.step = '1';
+    lightenRange.value = String(state.config.lighten);
+    lightenRange.addEventListener('input', () => {
+      const value = parseFloat(lightenRange.value);
+      lightenLabel.textContent = `Light boost (${value})`;
+      updateLightnessAndRebuild(value);
+    });
+    const lightenHint = document.createElement('small');
+    lightenHint.textContent = 'Gently brighten or darken before tracing. 0 keeps the original light balance.';
+    adjustSection.append(lightenLabel, lightenRange, lightenHint);
+
+    sectionLoad.append(loadTitle, uploadBox, urlField, adjustSection);
+
+    const infoSection = document.createElement('div');
+    infoSection.className = 'drawaria-omni-section';
+    const infoTitle = document.createElement('h3');
+    infoTitle.textContent = 'Image info';
+    const infoList = document.createElement('div');
+    infoList.className = 'drawaria-omni-stats';
+    infoList.dataset.role = 'image-info';
+    infoList.textContent = 'Load an image to see stats.';
+    infoSection.append(infoTitle, infoList);
+
+    tab.append(sectionLoad, infoSection);
+  }
+
+  function updateImageInfo() {
+    const infoEl = state.tabs.get('image')?.querySelector('[data-role="image-info"]');
+    if (!infoEl) return;
+    if (!state.image) {
+      infoEl.textContent = 'Load an image to see stats.';
+      return;
+    }
+    const { width, height, label } = state.image;
+    infoEl.innerHTML = `
+      <div><strong>Source:</strong> ${label}</div>
+      <div><strong>Preview size:</strong> ${width} × ${height} px</div>
+      <div><strong>Pixels sampled:</strong> ${(width * height).toLocaleString()}</div>
+      <div><strong>Stroke density:</strong> ${state.config.strokeDensity.toFixed(1)} px</div>
+    `;
+  }
+
+  function buildPathTab(tab) {
+    tab.innerHTML = '';
+    const section = document.createElement('div');
+    section.className = 'drawaria-omni-section';
+    const title = document.createElement('h3');
+    title.textContent = 'Path settings';
+
+    const densityField = createFieldNumber({
+      label: 'Stroke density (px)',
+      min: 1,
+      max: 4,
+      step: 0.1,
+      get: () => state.config.strokeDensity,
+      set: (value) => {
+        state.config.strokeDensity = clamp(value, 1, 4);
+      },
+      description: '1px keeps maximum detail. Higher values speed up drawing at the cost of detail.',
+    });
+
+    const toleranceField = createFieldRange({
+      label: 'Color blend',
+      min: 0,
+      max: 64,
+      step: 1,
+      get: () => state.config.colorTolerance,
+      set: (value) => {
+        state.config.colorTolerance = Math.round(clamp(value, 0, 64));
+      },
+      description: 'Merge nearby colors to use fewer swatches. 0 keeps every distinct color.',
+    });
+
+    const scanField = createFieldSelect({
+      label: 'Scan style',
+      options: [
+        { value: 'smart', label: 'Auto balance' },
+        { value: 'horizontal', label: 'Horizontal lines' },
+        { value: 'vertical', label: 'Vertical lines' },
+      ],
+      get: () => state.config.scanMode,
+      set: (value) => {
+        state.config.scanMode = value;
+      },
+      description: 'Choose how the bot travels across your image.',
+    });
+
+    const serpentineField = createFieldSelect({
+      label: 'Line order',
+      options: [
+        { value: 'serpentine', label: 'Serpentine (faster)' },
+        { value: 'restart', label: 'Reset every row' },
+      ],
+      get: () => (state.config.serpentine ? 'serpentine' : 'restart'),
+      set: (value) => {
+        state.config.serpentine = value === 'serpentine';
+      },
+      description: 'Serpentine lets lines continue back and forth to reduce travel time.',
+    });
+
+    section.append(title, densityField, toleranceField, scanField, serpentineField);
+
+    const statsSection = document.createElement('div');
+    statsSection.className = 'drawaria-omni-section';
+    const statsTitle = document.createElement('h3');
+    statsTitle.textContent = 'Path summary';
+    const statsList = document.createElement('div');
+    statsList.className = 'drawaria-omni-stats';
+    statsList.dataset.role = 'path-info';
+    statsList.textContent = 'Build a preview to see commands.';
+    statsSection.append(statsTitle, statsList);
+
+    tab.append(section, statsSection);
+  }
+
+  function buildBotTab(tab) {
+    tab.innerHTML = '';
+    const bot = state.bot;
+
+    const identitySection = document.createElement('div');
+    identitySection.className = 'drawaria-omni-section';
+    const identityTitle = document.createElement('h3');
+    identityTitle.textContent = 'Bot identity & room';
+
+    const nameField = document.createElement('div');
+    nameField.className = 'drawaria-omni-field';
+    const nameLabel = document.createElement('label');
+    nameLabel.textContent = 'Bot nickname';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'OmniDraw Bot';
+    nameInput.value = bot?.name || 'OmniDraw Bot';
+    nameInput.addEventListener('input', () => {
+      if (!bot) return;
+      bot.name = nameInput.value.trim() || 'OmniDraw Bot';
+    });
+    const nameHint = document.createElement('small');
+    nameHint.textContent = 'Choose how the helper appears when it joins a room.';
+    nameField.append(nameLabel, nameInput, nameHint);
+
+    const inviteField = document.createElement('div');
+    inviteField.className = 'drawaria-omni-field';
+    const inviteLabel = document.createElement('label');
+    inviteLabel.textContent = 'Invite / room code';
+    const inviteInput = document.createElement('input');
+    inviteInput.type = 'text';
+    inviteInput.placeholder = 'Leave blank for quick play';
+    inviteInput.value = bot?.invite || '';
+    inviteInput.addEventListener('input', () => {
+      if (!bot) return;
+      bot.invite = inviteInput.value.trim();
+    });
+    const inviteHint = document.createElement('small');
+    inviteHint.textContent = 'Paste the Drawaria invite link or room id for your room. This bot will stay with you until you disconnect it.';
+    inviteField.append(inviteLabel, inviteInput, inviteHint);
+
+    const buttonRow = document.createElement('div');
+    buttonRow.className = 'drawaria-omni-actions';
+    const joinBtn = document.createElement('button');
+    joinBtn.type = 'button';
+    joinBtn.className = 'drawaria-omni-button';
+    joinBtn.textContent = 'Join room';
+    joinBtn.addEventListener('click', () => {
+      if (!bot) return;
+      bot.name = nameInput.value.trim() || 'OmniDraw Bot';
+      bot.invite = inviteInput.value.trim();
+      bot.player.annonymize(bot.name);
+      bot.room.join(bot.invite);
+      updateBotDisplay();
+    });
+
+    const leaveBtn = document.createElement('button');
+    leaveBtn.type = 'button';
+    leaveBtn.className = 'drawaria-omni-button secondary';
+    leaveBtn.textContent = 'Disconnect';
+    leaveBtn.addEventListener('click', () => {
+      if (!bot) return;
+      bot.room.leave();
+      updateBotDisplay();
+    });
+
+    buttonRow.append(joinBtn, leaveBtn);
+
+    identitySection.append(identityTitle, nameField, inviteField, buttonRow);
+
+    const statusSection = document.createElement('div');
+    statusSection.className = 'drawaria-omni-section';
+    const statusTitle = document.createElement('h3');
+    statusTitle.textContent = 'Bot status';
+    const statusList = document.createElement('div');
+    statusList.className = 'drawaria-omni-stats';
+    state.ui.botStatus = statusList;
+    statusSection.append(statusTitle, statusList);
+
+    const scoutSection = document.createElement('div');
+    scoutSection.className = 'drawaria-omni-section';
+    const scoutTitle = document.createElement('h3');
+    scoutTitle.textContent = 'Scout bots (optional)';
+    const scoutNote = document.createElement('div');
+    scoutNote.className = 'drawaria-omni-note';
+    scoutNote.textContent = 'Launch auxiliary bots that explore other rooms without moving your main bot. They can join private invites or empty public lobbies.';
+
+    const scoutField = document.createElement('div');
+    scoutField.className = 'drawaria-omni-field';
+    const scoutLabel = document.createElement('label');
+    scoutLabel.textContent = 'Invites or room links';
+    const scoutInput = document.createElement('textarea');
+    scoutInput.placeholder = 'One invite per line. Leave a blank line to send a scout to a public lobby.';
+    const scoutHint = document.createElement('small');
+    scoutHint.textContent = 'Up to six scouts can run at once.';
+    scoutField.append(scoutLabel, scoutInput, scoutHint);
+
+    const scoutButtons = document.createElement('div');
+    scoutButtons.className = 'drawaria-omni-actions';
+    const launchScouts = document.createElement('button');
+    launchScouts.type = 'button';
+    launchScouts.className = 'drawaria-omni-button';
+    launchScouts.textContent = 'Launch scouts';
+    launchScouts.addEventListener('click', () => {
+      if (state.fleet.length >= 6) {
+        alert('The scout fleet is full. Remove an existing scout before adding another.');
+        return;
+      }
+      const lines = scoutInput.value.split(/\n+/);
+      if (!lines.length) {
+        lines.push('');
+      }
+      for (const raw of lines) {
+        if (state.fleet.length >= 6) {
+          break;
+        }
+        const invite = raw.trim();
+        createScoutBot(invite, `Scout ${state.fleet.length + 1}`);
+      }
+      updateFleetDisplay();
+    });
+
+    const clearScoutsBtn = document.createElement('button');
+    clearScoutsBtn.type = 'button';
+    clearScoutsBtn.className = 'drawaria-omni-button secondary';
+    clearScoutsBtn.textContent = 'Clear scouts';
+    clearScoutsBtn.addEventListener('click', () => {
+      clearScoutBots();
+      updateFleetDisplay();
+    });
+
+    scoutButtons.append(launchScouts, clearScoutsBtn);
+
+    const scoutList = document.createElement('div');
+    scoutList.className = 'drawaria-omni-stats drawaria-omni-fleet';
+    state.ui.fleetList = scoutList;
+
+    scoutSection.append(scoutTitle, scoutNote, scoutField, scoutButtons, scoutList);
+
+    tab.append(identitySection, statusSection, scoutSection);
+    updateBotDisplay();
+    updateFleetDisplay();
+  }
+
+
+  function updatePathInfo() {
+    const infoEl = state.tabs.get('path')?.querySelector('[data-role="path-info"]');
+    if (!infoEl) return;
+    if (!state.commands) {
+      infoEl.textContent = 'Build a preview to see commands.';
+      return;
+    }
+    const uniqueColors = state.commands.groups.length;
+    const totalSegments = state.commands.totalSegments;
+    const microPause = Math.max(0, state.config.pointerStep);
+    const perStrokeDelay = Math.max(0, state.config.strokeDelay) + microPause;
+    const estimatedTime = ((totalSegments * perStrokeDelay + uniqueColors * state.config.colorDelay) / 1000).toFixed(1);
+    infoEl.innerHTML = `
+      <div><strong>Segments:</strong> ${totalSegments.toLocaleString()}</div>
+      <div><strong>Colors detected:</strong> ${uniqueColors} / ${state.config.maxColors}</div>
+      <div><strong>Estimated runtime:</strong> ~${estimatedTime}s</div>
+      <div><strong>Preview mode:</strong> ${state.config.scanMode === 'smart' ? 'auto' : state.config.scanMode}</div>
+    `;
+  }
+
+  function buildPlacementTab(tab) {
+    tab.innerHTML = '';
+    const section = document.createElement('div');
+    section.className = 'drawaria-omni-section';
+    const title = document.createElement('h3');
+    title.textContent = 'Canvas placement';
+
+    const scaleField = createFieldRange({
+      label: 'Scale',
+      min: 0.25,
+      max: 1.6,
+      step: 0.05,
+      unit: '×',
+      get: () => state.config.scale,
+      set: (value) => {
+        state.config.scale = parseFloat(value.toFixed(2));
+      },
+      description: '1× uses the 650px resolution. Adjust to shrink or enlarge.',
+      onChange: () => updatePlacementInfo(),
+      formatValue: (value) => value.toFixed(2).replace(/\.00$/, ''),
+    });
+
+    const offsetXField = createFieldRange({
+      label: 'Offset X',
+      min: -400,
+      max: 400,
+      step: 1,
+      unit: 'px',
+      get: () => state.config.offsetX,
+      set: (value) => {
+        state.config.offsetX = Math.round(clamp(value, -400, 400));
+      },
+      description: 'Move left or right relative to the anchor point.',
+      onChange: () => updatePlacementInfo(),
+      formatValue: (value) => Math.round(value),
+    });
+
+    const offsetYField = createFieldRange({
+      label: 'Offset Y',
+      min: -400,
+      max: 400,
+      step: 1,
+      unit: 'px',
+      get: () => state.config.offsetY,
+      set: (value) => {
+        state.config.offsetY = Math.round(clamp(value, -400, 400));
+      },
+      description: 'Move up or down relative to the anchor point.',
+      onChange: () => updatePlacementInfo(),
+      formatValue: (value) => Math.round(value),
+    });
+
+    const alignField = createFieldSelect({
+      label: 'Anchor',
+      options: [
+        { value: 'center', label: 'Center' },
+        { value: 'top-left', label: 'Top left' },
+        { value: 'top-right', label: 'Top right' },
+        { value: 'bottom-left', label: 'Bottom left' },
+        { value: 'bottom-right', label: 'Bottom right' },
+      ],
+      get: () => state.config.align,
+      set: (value) => {
+        state.config.align = value;
+      },
+      description: 'Choose which corner stays fixed while offsetting.',
+      onChange: () => updatePlacementInfo(),
+    });
+
+    section.append(title, scaleField, offsetXField, offsetYField, alignField);
+
+    const infoSection = document.createElement('div');
+    infoSection.className = 'drawaria-omni-section';
+    const infoTitle = document.createElement('h3');
+    infoTitle.textContent = 'Placement summary';
+    const infoList = document.createElement('div');
+    infoList.className = 'drawaria-omni-stats';
+    infoList.dataset.role = 'placement-info';
+    infoList.textContent = 'Load an image to calculate placement.';
+    infoSection.append(infoTitle, infoList);
+
+    tab.append(section, infoSection);
+  }
+
+  function updatePlacementInfo() {
+    const infoEl = state.tabs.get('placement')?.querySelector('[data-role="placement-info"]');
+    if (!infoEl) return;
+    if (!state.image) {
+      infoEl.textContent = 'Load an image to calculate placement.';
+      return;
+    }
+    const rect = state.canvas.getBoundingClientRect();
+    const drawWidth = Math.round(state.image.width * state.config.scale);
+    const drawHeight = Math.round(state.image.height * state.config.scale);
+    const placement = computePlacement(rect);
+    infoEl.innerHTML = `
+      <div><strong>Board:</strong> ${Math.round(rect.width)} × ${Math.round(rect.height)} px</div>
+      <div><strong>Drawing size:</strong> ${drawWidth} × ${drawHeight} px</div>
+      <div><strong>Top-left:</strong> ${Math.round(placement.originX - rect.left)} px, ${Math.round(placement.originY - rect.top)} px</div>
+      <div><strong>Anchor:</strong> ${state.config.align.replace('-', ' ')}</div>
+    `;
+  }
+
+  function buildPreviewTab(tab) {
+    tab.innerHTML = '';
+    const previewSection = document.createElement('div');
+    previewSection.className = 'drawaria-omni-section';
+    const previewTitle = document.createElement('h3');
+    previewTitle.textContent = 'Preview generator';
+    const previewBox = document.createElement('div');
+    previewBox.className = 'drawaria-omni-preview-box';
+    const canvasEl = document.createElement('canvas');
+    canvasEl.width = 520;
+    canvasEl.height = 520;
+    const ctx = canvasEl.getContext('2d');
+    ctx.fillStyle = '#f1f5f9';
+    ctx.fillRect(0, 0, canvasEl.width, canvasEl.height);
+    previewBox.appendChild(canvasEl);
+    state.preview.canvas = canvasEl;
+    state.preview.ctx = ctx;
+
+    const controls = document.createElement('div');
+    controls.className = 'drawaria-omni-preview-controls';
+    controls.style.flexDirection = 'column';
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '0';
+    slider.value = '0';
+    slider.disabled = true;
+    slider.style.width = '100%';
+    slider.addEventListener('input', () => {
+      const value = parseInt(slider.value, 10) || 0;
+      state.preview.drawnSegments = value;
+      stopPreviewPlayback(false);
+      renderPreview(value);
+      updatePreviewControls();
+    });
+
+    const buttonsRow = document.createElement('div');
+    buttonsRow.style.display = 'flex';
+    buttonsRow.style.gap = '10px';
+    buttonsRow.style.width = '100%';
+
+    const playBtn = document.createElement('button');
+    playBtn.className = 'drawaria-omni-button';
+    playBtn.type = 'button';
+    playBtn.textContent = 'Play preview';
+    playBtn.addEventListener('click', () => startPreviewPlayback());
+
+    const pauseBtn = document.createElement('button');
+    pauseBtn.className = 'drawaria-omni-button secondary';
+    pauseBtn.type = 'button';
+    pauseBtn.textContent = 'Pause';
+    pauseBtn.addEventListener('click', () => {
+      stopPreviewPlayback(false);
+      updatePreviewControls();
+    });
+
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'drawaria-omni-button secondary';
+    resetBtn.type = 'button';
+    resetBtn.textContent = 'Reset';
+    resetBtn.addEventListener('click', () => {
+      stopPreviewPlayback(true);
+      renderPreview(0);
+      updatePreviewControls();
+    });
+
+    buttonsRow.append(playBtn, pauseBtn, resetBtn);
+    controls.append(slider, buttonsRow);
+
+    previewSection.append(previewTitle, previewBox, controls);
+
+    state.ui.previewSlider = slider;
+    state.ui.previewPlay = playBtn;
+    state.ui.previewPause = pauseBtn;
+    state.ui.previewReset = resetBtn;
+
+    const timingSection = document.createElement('div');
+    timingSection.className = 'drawaria-omni-section';
+    const timingTitle = document.createElement('h3');
+    timingTitle.textContent = 'Drawing rhythm';
+
+    const strokeField = createFieldRange({
+      label: 'Stroke pause',
+      min: 0,
+      max: 40,
+      step: 1,
+      unit: ' ms',
+      get: () => state.config.strokeDelay,
+      set: (value) => {
+        state.config.strokeDelay = Math.round(clamp(value, 0, 40));
+      },
+      description: 'Pause after each line. 0 is fastest.',
+      onChange: null,
+      formatValue: (value) => Math.round(value),
+    });
+
+    const colorField = createFieldNumber({
+      label: 'Pause between colors (ms)',
+      min: 0,
+      max: 600,
+      step: 10,
+      get: () => state.config.colorDelay,
+      set: (value) => {
+        state.config.colorDelay = Math.round(clamp(value, 0, 600));
+      },
+      description: 'Wait after switching palettes to stay in sync.',
+      onChange: null,
+    });
+
+    const pointerField = createFieldRange({
+      label: 'Micro delay',
+      min: 0,
+      max: 20,
+      step: 1,
+      unit: ' ms',
+      get: () => state.config.pointerStep,
+      set: (value) => {
+        state.config.pointerStep = Math.round(clamp(value, 0, 20));
+      },
+      description: 'Add a tiny pause after each stroke to keep the websocket stream silky smooth.',
+      onChange: null,
+      formatValue: (value) => Math.round(value),
+    });
+
+    const durationField = createFieldRange({
+      label: 'Preview length',
+      min: 3,
+      max: 20,
+      step: 1,
+      unit: ' s',
+      get: () => state.config.previewDuration,
+      set: (value) => {
+        state.config.previewDuration = Math.round(clamp(value, 3, 20));
+      },
+      description: 'Time for the animation to reach 100%.',
+      onChange: () => {
+        if (state.preview.playing) {
+          stopPreviewPlayback(false);
+          startPreviewPlayback();
+        }
+      },
+      formatValue: (value) => Math.round(value),
+    });
+
+    timingSection.append(timingTitle, strokeField, colorField, pointerField, durationField);
+
+    tab.append(previewSection, timingSection);
+  }
+
+  function updatePreviewControls() {
+    const total = state.commands ? state.commands.totalSegments : 0;
+    const slider = state.ui.previewSlider;
+    if (slider) {
+      slider.max = String(total || 0);
+      slider.value = String(Math.min(state.preview.drawnSegments, total || 0));
+      slider.disabled = !total;
+    }
+    if (state.ui.previewPlay) {
+      state.ui.previewPlay.disabled = !total || state.preview.playing;
+    }
+    if (state.ui.previewPause) {
+      state.ui.previewPause.disabled = !state.preview.playing;
+    }
+    if (state.ui.previewReset) {
+      state.ui.previewReset.disabled = !total;
+    }
+  }
+
+  function renderPreview(segmentCount) {
+    const canvasEl = state.preview.canvas;
+    const ctx = state.preview.ctx;
+    if (!canvasEl || !ctx) return;
+    ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvasEl.width, canvasEl.height);
+
+    if (!state.commands || !state.image) {
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '16px "Inter", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Load an image to preview the path.', canvasEl.width / 2, canvasEl.height / 2);
+      state.preview.drawnSegments = 0;
+      updatePreviewControls();
+      return;
+    }
+
+    const total = state.commands.totalSegments;
+    const limit = segmentCount === undefined || segmentCount === null ? total : Math.max(0, Math.min(total, segmentCount));
+    state.preview.drawnSegments = limit;
+
+    const scale = Math.min(canvasEl.width / state.image.width, canvasEl.height / state.image.height);
+    const offsetX = (canvasEl.width - state.image.width * scale) / 2;
+    const offsetY = (canvasEl.height - state.image.height * scale) / 2;
+
+    ctx.lineWidth = 1;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    let drawn = 0;
+    outer: for (const group of state.commands.groups) {
+      ctx.strokeStyle = group.hex;
+      for (const segment of group.segments) {
+        if (drawn >= limit) break outer;
+        ctx.beginPath();
+        const startX = offsetX + (segment.x1 + 0.5) * scale;
+        const startY = offsetY + (segment.y1 + 0.5) * scale;
+        const endX = offsetX + (segment.x2 + 0.5) * scale;
+        const endY = offsetY + (segment.y2 + 0.5) * scale;
+        ctx.moveTo(startX, startY);
+        ctx.lineTo(endX, endY);
+        ctx.stroke();
+        drawn += 1;
+      }
+    }
+
+    updatePreviewControls();
+  }
+
+  function startPreviewPlayback() {
+    if (!state.commands || state.preview.playing) {
+      return;
+    }
+    const total = state.commands.totalSegments;
+    if (!total) {
+      return;
+    }
+    stopPreviewPlayback(true);
+    state.preview.playing = true;
+    updatePreviewControls();
+    const duration = Math.max(1000, state.config.previewDuration * 1000);
+    const start = performance.now();
+
+    const step = (time) => {
+      if (!state.preview.playing) {
+        return;
+      }
+      const elapsed = time - start;
+      const progress = Math.min(1, elapsed / duration);
+      const target = Math.floor(total * progress);
+      renderPreview(target);
+      if (progress < 1) {
+        state.preview.raf = requestAnimationFrame(step);
+      } else {
+        state.preview.playing = false;
+        state.preview.raf = null;
+        updatePreviewControls();
+      }
+    };
+
+    state.preview.raf = requestAnimationFrame(step);
+  }
+
+  function stopPreviewPlayback(reset = false) {
+    if (state.preview.raf) {
+      cancelAnimationFrame(state.preview.raf);
+      state.preview.raf = null;
+    }
+    if (state.preview.playing) {
+      state.preview.playing = false;
+    }
+    if (reset) {
+      state.preview.drawnSegments = 0;
+    }
+    updatePreviewControls();
+  }
+
+  function buildGuideTab(tab) {
+    tab.innerHTML = '';
+    const section = document.createElement('div');
+    section.className = 'drawaria-omni-section';
+    const title = document.createElement('h3');
+    title.textContent = 'Quick guide';
+    const list = document.createElement('div');
+    list.className = 'drawaria-omni-stats';
+    list.innerHTML = `
+      <div>1. Load an image from your device or paste a direct link.</div>
+      <div>2. Tweak path settings to balance speed and detail.</div>
+      <div>3. Use the preview tab to watch the stroke order.</div>
+      <div>4. Position the drawing with placement controls.</div>
+      <div>5. Press "Start drawing" and let OmniDraw paint for you.</div>
+    `;
+    section.append(title, list);
+    tab.append(section);
+  }
+
+  function buildFooter() {
+    const footer = document.createElement('div');
+    footer.className = 'drawaria-omni-footer';
+
+    const progressWrap = document.createElement('div');
+    progressWrap.className = 'drawaria-omni-progress';
+    const progressText = document.createElement('span');
+    progressText.textContent = 'Load an image to get started.';
+    const progressBar = document.createElement('div');
+    progressBar.className = 'drawaria-omni-progress-bar';
+    const connectionStatus = document.createElement('small');
+    connectionStatus.className = 'drawaria-omni-conn';
+    connectionStatus.textContent = 'Join a game room to enable the bot.';
+
+    progressWrap.append(progressText, progressBar, connectionStatus);
+
+    const actions = document.createElement('div');
+    actions.className = 'drawaria-omni-actions';
+    const startBtn = document.createElement('button');
+    startBtn.className = 'drawaria-omni-button';
+    startBtn.type = 'button';
+    startBtn.textContent = 'Start drawing';
+    startBtn.addEventListener('click', () => startDrawing());
+
+    const stopBtn = document.createElement('button');
+    stopBtn.className = 'drawaria-omni-button secondary';
+    stopBtn.type = 'button';
+    stopBtn.textContent = 'Stop';
+    stopBtn.disabled = true;
+    stopBtn.addEventListener('click', () => stopDrawing());
+
+    actions.append(startBtn, stopBtn);
+
+    footer.append(progressWrap, actions);
+
+    state.ui.progressText = progressText;
+    state.ui.progressBar = progressBar;
+    state.ui.startBtn = startBtn;
+    state.ui.stopBtn = stopBtn;
+    state.ui.connectionStatus = connectionStatus;
+
+    return footer;
+  }
+
+  function updateProgressDisplay(message, ratio = null) {
+    if (state.ui.progressText) {
+      state.ui.progressText.textContent = message;
+    }
+    if (state.ui.progressBar) {
+      const value = ratio === null ? 0 : Math.max(0, Math.min(1, ratio));
+      state.ui.progressBar.style.setProperty('--progress', `${Math.round(value * 100)}%`);
+    }
+  }
+
+  function updateActionButtons() {
+    if (state.ui.startBtn) {
+      const botReady = state.bot && state.bot.status === 'connected';
+      state.ui.startBtn.disabled = state.drawing || !state.commands || !state.commands.totalSegments || !botReady;
+    }
+    if (state.ui.stopBtn) {
+      state.ui.stopBtn.disabled = !state.drawing;
+    }
+  }
+
+  function handleSettingsChange() {
+    if (!state.image || state.drawing) {
+      return;
+    }
+    if (state.rebuildTimer) {
+      clearTimeout(state.rebuildTimer);
+    }
+    state.rebuildTimer = setTimeout(() => {
+      state.rebuildTimer = null;
+      buildCommands();
+    }, 180);
+  }
+
+  async function buildCommands() {
+    if (!state.image || state.drawing) {
+      return;
+    }
+    const { width, height } = state.image;
+    const imageData = state.image.data;
+    if (!imageData) {
+      state.commands = null;
+      updatePathInfo();
+      updatePlacementInfo();
+      updatePreviewControls();
+      updateActionButtons();
+      updateProgressDisplay('Load an image to get started.', 0);
+      return;
+    }
+
+    const raw = imageData.data;
+    const step = Math.max(1, Math.round(state.config.strokeDensity));
+    const alphaThreshold = 24;
+    const orientation = state.config.scanMode === 'smart'
+      ? (width >= height ? 'horizontal' : 'vertical')
+      : state.config.scanMode;
+
+    const groups = new Map();
+    const palette = [];
+    const visited = new Uint8Array(width * height);
+
+    const obtainGroup = (rgb) => {
+      let closest = null;
+      let closestDistance = Number.POSITIVE_INFINITY;
+      for (const entry of palette) {
+        const dist = colorDistance(rgb, entry.rgb);
+        if (dist < closestDistance) {
+          closestDistance = dist;
+          closest = entry;
+        }
+        if (dist <= state.config.colorTolerance) {
+          return groups.get(entry.key);
+        }
+      }
+      if (palette.length >= state.config.maxColors && closest) {
+        const existing = groups.get(closest.key);
+        if (existing) {
+          const samples = (existing.samples || 1) + 1;
+          existing.samples = samples;
+          existing.rgb = {
+            r: Math.round(((existing.rgb?.r ?? rgb.r) * (samples - 1) + rgb.r) / samples),
+            g: Math.round(((existing.rgb?.g ?? rgb.g) * (samples - 1) + rgb.g) / samples),
+            b: Math.round(((existing.rgb?.b ?? rgb.b) * (samples - 1) + rgb.b) / samples),
+          };
+          existing.hex = rgbToHex(existing.rgb);
+          closest.rgb = { ...existing.rgb };
+          return existing;
+        }
+      }
+      const key = `c${palette.length}`;
+      const clone = { r: rgb.r, g: rgb.g, b: rgb.b };
+      const group = {
+        key,
+        rgb: clone,
+        hex: rgbToHex(clone),
+        segments: [],
+        pixelCount: 0,
+        samples: 1,
+      };
+      palette.push({ key, rgb: clone });
+      groups.set(key, group);
+      return group;
+    };
+
+    const markSegment = (x1, y1, x2, y2) => {
+      const clampPoint = (x, y) => {
+        if (x < 0 || y < 0 || x >= width || y >= height) {
+          return null;
+        }
+        return y * width + x;
+      };
+      if (x1 === x2) {
+        const start = Math.min(y1, y2);
+        const end = Math.max(y1, y2);
+        for (let yy = start; yy <= end; yy++) {
+          const idx = clampPoint(x1, yy);
+          if (idx != null) {
+            visited[idx] = 1;
+          }
+        }
+        return;
+      }
+      if (y1 === y2) {
+        const start = Math.min(x1, x2);
+        const end = Math.max(x1, x2);
+        for (let xx = start; xx <= end; xx++) {
+          const idx = clampPoint(xx, y1);
+          if (idx != null) {
+            visited[idx] = 1;
+          }
+        }
+        return;
+      }
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const steps = Math.max(Math.abs(dx), Math.abs(dy));
+      for (let i = 0; i <= steps; i++) {
+        const t = steps === 0 ? 0 : i / steps;
+        const xx = Math.round(x1 + dx * t);
+        const yy = Math.round(y1 + dy * t);
+        const idx = clampPoint(xx, yy);
+        if (idx != null) {
+          visited[idx] = 1;
+        }
+      }
+    };
+
+    const pushSegment = (group, x1, y1, x2, y2) => {
+      if (!group) return;
+      const length = Math.max(1, Math.round(Math.hypot(x2 - x1, y2 - y1)));
+      group.segments.push({ x1, y1, x2, y2 });
+      group.pixelCount += length;
+      group.samples = (group.samples || 0) + length;
+      markSegment(Math.round(x1), Math.round(y1), Math.round(x2), Math.round(y2));
+    };
+
+    if (orientation === 'vertical') {
+      for (let col = 0; col < width; col += step) {
+        const x = Math.min(width - 1, col);
+        const serp = state.config.serpentine && ((Math.floor(col / step) % 2) === 1);
+        let runGroup = null;
+        let startY = null;
+        let endY = null;
+        if (!serp) {
+          for (let y = 0; y < height; y++) {
+            const idx = (y * width + x) * 4;
+            if (idx >= raw.length) break;
+            const alpha = raw[idx + 3];
+            if (alpha < alphaThreshold) {
+              if (runGroup) {
+                pushSegment(runGroup, x, startY, x, endY);
+                runGroup = null;
+              }
+              continue;
+            }
+            const rgb = { r: raw[idx], g: raw[idx + 1], b: raw[idx + 2] };
+            const group = obtainGroup(rgb);
+            if (runGroup !== group) {
+              if (runGroup) {
+                pushSegment(runGroup, x, startY, x, endY);
+              }
+              runGroup = group;
+              startY = y;
+              endY = y;
+            } else {
+              endY = y;
+            }
+          }
+        } else {
+          for (let y = height - 1; y >= 0; y--) {
+            const idx = (y * width + x) * 4;
+            if (idx >= raw.length) break;
+            const alpha = raw[idx + 3];
+            if (alpha < alphaThreshold) {
+              if (runGroup) {
+                pushSegment(runGroup, x, startY, x, endY);
+                runGroup = null;
+              }
+              continue;
+            }
+            const rgb = { r: raw[idx], g: raw[idx + 1], b: raw[idx + 2] };
+            const group = obtainGroup(rgb);
+            if (runGroup !== group) {
+              if (runGroup) {
+                pushSegment(runGroup, x, startY, x, endY);
+              }
+              runGroup = group;
+              startY = y;
+              endY = y;
+            } else {
+              startY = y;
+            }
+          }
+        }
+        if (runGroup) {
+          pushSegment(runGroup, x, startY, x, endY);
+        }
+      }
+    } else {
+      for (let row = 0; row < height; row += step) {
+        const y = Math.min(height - 1, row);
+        const serp = state.config.serpentine && ((Math.floor(row / step) % 2) === 1);
+        let runGroup = null;
+        let startX = null;
+        let endX = null;
+        if (!serp) {
+          for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            if (idx >= raw.length) break;
+            const alpha = raw[idx + 3];
+            if (alpha < alphaThreshold) {
+              if (runGroup) {
+                pushSegment(runGroup, startX, y, endX, y);
+                runGroup = null;
+              }
+              continue;
+            }
+            const rgb = { r: raw[idx], g: raw[idx + 1], b: raw[idx + 2] };
+            const group = obtainGroup(rgb);
+            if (runGroup !== group) {
+              if (runGroup) {
+                pushSegment(runGroup, startX, y, endX, y);
+              }
+              runGroup = group;
+              startX = x;
+              endX = x;
+            } else {
+              endX = x;
+            }
+          }
+        } else {
+          for (let x = width - 1; x >= 0; x--) {
+            const idx = (y * width + x) * 4;
+            if (idx >= raw.length) break;
+            const alpha = raw[idx + 3];
+            if (alpha < alphaThreshold) {
+              if (runGroup) {
+                pushSegment(runGroup, startX, y, endX, y);
+                runGroup = null;
+              }
+              continue;
+            }
+            const rgb = { r: raw[idx], g: raw[idx + 1], b: raw[idx + 2] };
+            const group = obtainGroup(rgb);
+            if (runGroup !== group) {
+              if (runGroup) {
+                pushSegment(runGroup, startX, y, endX, y);
+              }
+              runGroup = group;
+              startX = x;
+              endX = x;
+            } else {
+              startX = x;
+            }
+          }
+        }
+        if (runGroup) {
+          pushSegment(runGroup, startX, y, endX, y);
+        }
+      }
+    }
+
+    const fillTolerance = Math.max(4, state.config.colorTolerance * 1.5);
+
+    const fillHorizontalGaps = () => {
+      for (let y = 0; y < height; y++) {
+        let x = 0;
+        while (x < width) {
+          const idx = (y * width + x) * 4;
+          if (idx >= raw.length) break;
+          if (raw[idx + 3] < alphaThreshold || visited[y * width + x]) {
+            x++;
+            continue;
+          }
+          const baseRgb = { r: raw[idx], g: raw[idx + 1], b: raw[idx + 2] };
+          const group = obtainGroup(baseRgb);
+          let startX = x;
+          let endX = x;
+          let avgR = baseRgb.r;
+          let avgG = baseRgb.g;
+          let avgB = baseRgb.b;
+          let count = 1;
+          while (endX + 1 < width) {
+            const nextIdx = (y * width + (endX + 1)) * 4;
+            if (nextIdx >= raw.length) break;
+            if (raw[nextIdx + 3] < alphaThreshold) break;
+            if (visited[y * width + endX + 1]) break;
+            const nextRgb = { r: raw[nextIdx], g: raw[nextIdx + 1], b: raw[nextIdx + 2] };
+            const diff = colorDistance(nextRgb, { r: avgR, g: avgG, b: avgB });
+            if (diff > fillTolerance) {
+              break;
+            }
+            endX += 1;
+            count += 1;
+            avgR = (avgR * (count - 1) + nextRgb.r) / count;
+            avgG = (avgG * (count - 1) + nextRgb.g) / count;
+            avgB = (avgB * (count - 1) + nextRgb.b) / count;
+          }
+          if (endX === startX) {
+            if (startX + 1 < width && raw[(y * width + startX + 1) * 4 + 3] >= alphaThreshold) {
+              endX = startX + 1;
+            } else if (startX > 0 && raw[(y * width + startX - 1) * 4 + 3] >= alphaThreshold) {
+              startX = startX - 1;
+            }
+          }
+          pushSegment(group, startX, y, endX, y);
+          x = endX + 1;
+        }
+      }
+    };
+
+    const fillVerticalGaps = () => {
+      for (let x = 0; x < width; x++) {
+        let y = 0;
+        while (y < height) {
+          const idx = (y * width + x) * 4;
+          if (idx >= raw.length) break;
+          if (raw[idx + 3] < alphaThreshold || visited[y * width + x]) {
+            y++;
+            continue;
+          }
+          const baseRgb = { r: raw[idx], g: raw[idx + 1], b: raw[idx + 2] };
+          const group = obtainGroup(baseRgb);
+          let startY = y;
+          let endY = y;
+          let avgR = baseRgb.r;
+          let avgG = baseRgb.g;
+          let avgB = baseRgb.b;
+          let count = 1;
+          while (endY + 1 < height) {
+            const nextIdx = ((endY + 1) * width + x) * 4;
+            if (nextIdx >= raw.length) break;
+            if (raw[nextIdx + 3] < alphaThreshold) break;
+            if (visited[(endY + 1) * width + x]) break;
+            const nextRgb = { r: raw[nextIdx], g: raw[nextIdx + 1], b: raw[nextIdx + 2] };
+            const diff = colorDistance(nextRgb, { r: avgR, g: avgG, b: avgB });
+            if (diff > fillTolerance) {
+              break;
+            }
+            endY += 1;
+            count += 1;
+            avgR = (avgR * (count - 1) + nextRgb.r) / count;
+            avgG = (avgG * (count - 1) + nextRgb.g) / count;
+            avgB = (avgB * (count - 1) + nextRgb.b) / count;
+          }
+          if (endY === startY) {
+            if (startY + 1 < height && raw[((startY + 1) * width + x) * 4 + 3] >= alphaThreshold) {
+              endY = startY + 1;
+            } else if (startY > 0 && raw[((startY - 1) * width + x) * 4 + 3] >= alphaThreshold) {
+              startY = startY - 1;
+            }
+          }
+          pushSegment(group, x, startY, x, endY);
+          y = endY + 1;
+        }
+      }
+    };
+
+    fillHorizontalGaps();
+    fillVerticalGaps();
+
+    const groupsArray = Array.from(groups.values()).filter((group) => group.segments.length > 0);
+    groupsArray.sort((a, b) => b.pixelCount - a.pixelCount);
+    const totalSegments = groupsArray.reduce((sum, group) => sum + group.segments.length, 0);
+    state.commands = {
+      groups: groupsArray,
+      totalSegments,
+      width,
+      height,
+    };
+    state.progress = { segments: 0, total: totalSegments };
+    state.preview.drawnSegments = Math.min(state.preview.drawnSegments, totalSegments);
+    updatePathInfo();
+    updatePlacementInfo();
+    updatePreviewControls();
+    updateActionButtons();
+    updateProgressDisplay(totalSegments ? `Ready. ${totalSegments.toLocaleString()} strokes queued.` : 'Image ready but nothing to draw.', 0);
+    renderPreview(state.preview.drawnSegments);
+  }
+
+  function computePlacement(rect) {
+    if (!state.image) {
+      return { originX: rect.left, originY: rect.top, scale: state.config.scale };
+    }
+    const scale = state.config.scale;
+    const drawWidth = state.image.width * scale;
+    const drawHeight = state.image.height * scale;
+    let originX = rect.left;
+    let originY = rect.top;
+    switch (state.config.align) {
+      case 'top-left':
+        originX = rect.left;
+        originY = rect.top;
+        break;
+      case 'top-right':
+        originX = rect.right - drawWidth;
+        originY = rect.top;
+        break;
+      case 'bottom-left':
+        originX = rect.left;
+        originY = rect.bottom - drawHeight;
+        break;
+      case 'bottom-right':
+        originX = rect.right - drawWidth;
+        originY = rect.bottom - drawHeight;
+        break;
+      default:
+        originX = rect.left + (rect.width - drawWidth) / 2;
+        originY = rect.top + (rect.height - drawHeight) / 2;
+        break;
+    }
+    originX += state.config.offsetX;
+    originY += state.config.offsetY;
+    return { originX, originY, scale };
+  }
+
+  async function startDrawing() {
+    if (state.drawing) return;
+    if (!state.commands || !state.commands.totalSegments) {
+      alert('Load an image and build the preview before drawing.');
+      return;
+    }
+
+    if (!state.bot || state.bot.status !== 'connected') {
+      alert('Connect the OmniDraw bot from the Bot tab before drawing.');
+      return;
+    }
+
+    const socket = getActiveSocket();
+    if (!socket) {
+      updateConnectionStatus();
+      alert('Join a drawing room first so OmniDraw can stream commands through the bot connection.');
+      return;
+    }
+    const ready = await waitForSocketReady(socket);
+    if (!ready) {
+      updateConnectionStatus();
+      alert('The Drawaria connection is still starting. Try again in a moment.');
+      return;
+    }
+
+    stopPreviewPlayback(false);
+    state.abort = false;
+    state.drawing = true;
+    updateActionButtons();
+
+    const total = state.commands.totalSegments;
+    state.progress = { segments: 0, total };
+    updateProgressDisplay('Streaming strokes to the bot…', 0);
+
+    const rect = state.canvas.getBoundingClientRect();
+    const placement = computePlacement(rect);
+    const thickness = Math.max(0.5, state.config.strokeDensity);
+
+    try {
+      for (const group of state.commands.groups) {
+        if (state.abort) break;
+        const ok = await ensureColor(group.hex);
+        if (!ok) {
+          console.warn('OmniDraw: unable to activate palette color', group.hex);
+        }
+        await delay(Math.max(0, state.config.colorDelay));
+
+        for (const segment of group.segments) {
+          if (state.abort) break;
+          if (socket.readyState !== WebSocket.OPEN) {
+            throw new Error('Connection closed while drawing.');
+          }
+          const normalized = normalizeSegmentForBoard(segment, placement, rect);
+          if (!normalized) {
+            continue;
+          }
+          sendDrawCommand(socket, normalized, group.hex, thickness);
+          state.progress.segments += 1;
+          const ratio = total ? state.progress.segments / total : 0;
+          updateProgressDisplay(`Drawing... ${state.progress.segments}/${total} strokes`, ratio);
+          renderPreview(state.progress.segments);
+          const microPause = Math.max(0, state.config.pointerStep);
+          const totalDelay = Math.max(0, state.config.strokeDelay) + microPause;
+          if (totalDelay > 0) {
+            await delay(totalDelay);
+          }
+        }
+      }
+
+      if (state.abort) {
+        const ratio = total ? state.progress.segments / total : 0;
+        updateProgressDisplay(`Stopped at ${state.progress.segments}/${total} strokes`, ratio);
+      } else {
+        updateProgressDisplay('Completed! Ready for another run.', 1);
+      }
+    } catch (err) {
+      console.error('OmniDraw drawing error', err);
+      const ratio = total ? state.progress.segments / total : 0;
+      updateProgressDisplay('Error: ' + err.message, ratio);
+      alert('Drawing failed: ' + err.message);
+    } finally {
+      await restoreInitialColor();
+      state.drawing = false;
+      state.abort = false;
+      updateActionButtons();
+      updateConnectionStatus();
+    }
+  }
+
+  function stopDrawing() {
+    if (!state.drawing) {
+      return;
+    }
+    state.abort = true;
+    const ratio = state.progress.total ? state.progress.segments / state.progress.total : 0;
+    updateProgressDisplay('Stopping...', ratio);
+  }
+
+  async function destroy() {
+    try {
+      stopPreviewPlayback(false);
+      state.abort = true;
+      if (state.keyHandler) {
+        window.removeEventListener('keydown', state.keyHandler);
+        state.keyHandler = null;
+      }
+      if (state.bot?.room) {
+        try {
+          state.bot.room.leave();
+        } catch (err) {
+          console.debug('OmniDraw bot leave error', err);
+        }
+      }
+      clearScoutBots();
+      await restoreInitialColor();
+      if (state.style && state.style.parentNode) {
+        state.style.parentNode.removeChild(state.style);
+      }
+      if (state.root && state.root.parentNode) {
+        state.root.parentNode.removeChild(state.root);
+      }
+      state.ui.connectionStatus = null;
+      state.ui.botStatus = null;
+      state.ui.fleetList = null;
+    } finally {
+      window.__drawariaOmniDraw = undefined;
+      window.__drawariaOmniBot = undefined;
+    }
+  }
+
+  function handleKeydown(event) {
+    if (event.key === 'Escape') {
+      stopDrawing();
+    }
+  }
+
+  function createPanel() {
+    const panel = document.createElement('div');
+    panel.className = 'drawaria-omni-panel';
+    const header = createHeader(panel);
+    const { tabBar, contentWrap } = createTabs(panel);
+    panel.append(header, tabBar, contentWrap);
+    buildImageTab(state.tabs.get('image'));
+    buildPathTab(state.tabs.get('path'));
+    buildBotTab(state.tabs.get('bot'));
+    buildPlacementTab(state.tabs.get('placement'));
+    buildPreviewTab(state.tabs.get('preview'));
+    buildGuideTab(state.tabs.get('guide'));
+    const footer = buildFooter();
+    panel.appendChild(footer);
+    return panel;
+  }
+
+  injectStyles();
+  createRoot();
+  state.panel = createPanel();
+  state.root.appendChild(state.panel);
+  updateConnectionStatus();
+  updateImageInfo();
+  updatePathInfo();
+  updatePlacementInfo();
+  updatePreviewControls();
+  updateActionButtons();
+  updateProgressDisplay('Load an image to get started.', 0);
+  renderPreview(0);
+
+  state.keyHandler = handleKeydown;
+  window.addEventListener('keydown', state.keyHandler);
+
+  window.__drawariaOmniDraw = {
+    destroy,
+    start: startDrawing,
+    stop: stopDrawing,
+    preview: startPreviewPlayback,
+  };
+
+  console.info('%cOmniDraw Studio ready', 'color:#2563eb;font-weight:bold;', 'Load an image to begin.');
 })();
