@@ -137,7 +137,7 @@
           }
         }
       } catch (err) {
-        console.debug('OmniDraw socket parse issue', err);
+        console.debug("Diabolical's Autodraw socket parse issue", err);
       }
       updateConnectionStatus();
     };
@@ -388,7 +388,7 @@
 
   function createBotLogic(options = {}) {
     const settings = {
-      name: 'OmniDraw Bot',
+      name: "Diabolical's Autodraw Bot",
       invite: '',
       primary: true,
       allowRandom: false,
@@ -397,7 +397,7 @@
     };
 
     const bot = {
-      name: settings.name || 'OmniDraw Bot',
+      name: settings.name || "Diabolical's Autodraw Bot",
       invite: settings.invite || '',
       status: 'idle',
       lastError: null,
@@ -472,7 +472,7 @@
             this.player.room.players = configs.players ?? this.player.room.players;
           }
         } catch (err) {
-          console.debug('OmniDraw bot config parse failed', err);
+          console.debug("Diabolical's Autodraw bot config parse failed", err);
         }
         notify();
       }
@@ -489,7 +489,7 @@
         }
         notify();
       } catch (err) {
-        console.debug('OmniDraw bot broadcast parse failed', err);
+        console.debug("Diabolical's Autodraw bot broadcast parse failed", err);
       }
     };
 
@@ -500,7 +500,7 @@
         try {
           this.socket.close(1000, 'reconnect');
         } catch (err) {
-          console.debug('OmniDraw bot close issue', err);
+          console.debug("Diabolical's Autodraw bot close issue", err);
         }
       }
       bot.status = 'connecting';
@@ -527,7 +527,7 @@
         try {
           this.socket.close(code, reason);
         } catch (err) {
-          console.debug('OmniDraw bot close error', err);
+          console.debug("Diabolical's Autodraw bot close error", err);
         }
       }
       clearTimeout(this._hbTimer);
@@ -543,7 +543,7 @@
             this.socket.send(2);
             this.Heartbeat(interval);
           } catch (err) {
-            console.debug('OmniDraw bot heartbeat error', err);
+            console.debug("Diabolical's Autodraw bot heartbeat error", err);
           }
         }
       }, interval);
@@ -802,7 +802,10 @@
     const dr = a.r - b.r;
     const dg = a.g - b.g;
     const db = a.b - b.b;
-    return Math.sqrt(dr * dr + dg * dg + db * db);
+    const rMean = (a.r + b.r) / 2;
+    const weightR = 2 + rMean / 256;
+    const weightB = 2 + (255 - rMean) / 256;
+    return Math.sqrt(weightR * dr * dr + 4 * dg * dg + weightB * db * db);
   }
 
   function adjustLightness(rgb, amount) {
@@ -979,7 +982,7 @@
       await delay(32);
       return true;
     } catch (err) {
-      console.warn('Drawaria OmniDraw: failed to activate color swatch', err);
+      console.warn("Diabolical's Autodraw: failed to activate color swatch", err);
       return false;
     }
   }
@@ -1068,7 +1071,7 @@
 
   const canvas = findDrawingCanvas();
   if (!canvas) {
-    alert('Drawaria OmniDraw: join a drawing room before running this helper.');
+    alert("Diabolical's Autodraw: join a drawing room before running this helper.");
     return;
   }
   state.canvas = canvas;
@@ -1085,17 +1088,17 @@
       }
       .drawaria-omni-panel {
         position: absolute;
-        top: 28px;
-        left: 28px;
-        width: min(480px, calc(100vw - 56px));
-        max-height: min(82vh, 720px);
-        height: clamp(520px, 70vh, 680px);
-        color: #0f172a;
-        background: linear-gradient(155deg, rgba(255, 255, 255, 0.96), rgba(236, 243, 255, 0.94));
-        border-radius: 26px;
-        box-shadow: 0 34px 80px rgba(15, 23, 42, 0.34);
-        border: 1px solid rgba(148, 163, 184, 0.28);
-        backdrop-filter: blur(26px);
+        top: 22px;
+        left: 22px;
+        width: min(560px, calc(100vw - 44px));
+        max-height: min(80vh, 760px);
+        height: clamp(520px, 68vh, 720px);
+        color: #0b172a;
+        background: linear-gradient(165deg, #f7fbff, #eef4ff 60%, #e0edff);
+        border-radius: 22px;
+        box-shadow: 0 20px 90px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(59, 130, 246, 0.18);
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        backdrop-filter: blur(16px) saturate(140%);
         pointer-events: auto;
         display: flex;
         flex-direction: column;
@@ -1106,9 +1109,9 @@
         content: '';
         position: absolute;
         inset: 0;
-        background: radial-gradient(circle at top right, rgba(96, 165, 250, 0.28), transparent 55%), radial-gradient(circle at bottom left, rgba(167, 139, 250, 0.32), transparent 45%);
+        background: radial-gradient(circle at 22% 18%, rgba(59, 130, 246, 0.22), transparent 36%), radial-gradient(circle at 76% 22%, rgba(96, 165, 250, 0.28), transparent 42%), radial-gradient(circle at 30% 78%, rgba(34, 197, 94, 0.18), transparent 38%);
         pointer-events: none;
-        opacity: 0.85;
+        opacity: 0.9;
       }
       .drawaria-omni-panel > * {
         position: relative;
@@ -1122,92 +1125,96 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 18px;
-        padding: 20px 24px 16px;
-        background: linear-gradient(135deg, rgba(59, 130, 246, 0.42), rgba(147, 197, 253, 0.24));
-        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+        gap: 14px;
+        padding: 18px 20px 12px;
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.86), rgba(226, 238, 255, 0.94));
+        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
         cursor: grab;
         user-select: none;
       }
       .drawaria-omni-title {
         display: flex;
         flex-direction: column;
-        gap: 6px;
+        gap: 4px;
       }
       .drawaria-omni-title strong {
-        font-weight: 700;
-        letter-spacing: 0.4px;
+        font-weight: 800;
+        letter-spacing: 0.2px;
         font-size: 17px;
+        color: #0f172a;
       }
       .drawaria-omni-title span {
         font-size: 12px;
-        color: rgba(15, 23, 42, 0.7);
-        letter-spacing: 0.2px;
+        color: #1e293b;
+        letter-spacing: 0.1px;
       }
       .drawaria-omni-header button {
-        border: none;
-        background: rgba(255, 255, 255, 0.95);
-        color: #1d4ed8;
-        width: 36px;
-        height: 36px;
-        border-radius: 50%;
-        font-size: 18px;
-        font-weight: 600;
+        border: 1px solid rgba(59, 130, 246, 0.25);
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(224, 242, 254, 0.9));
+        color: #0f172a;
+        width: 34px;
+        height: 34px;
+        border-radius: 12px;
+        font-size: 15px;
+        font-weight: 700;
         display: grid;
         place-items: center;
-        box-shadow: 0 14px 32px rgba(37, 99, 235, 0.24);
+        box-shadow: 0 12px 28px rgba(59, 130, 246, 0.16);
         cursor: pointer;
-        transition: transform 140ms ease, box-shadow 140ms ease;
+        transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
       }
       .drawaria-omni-header button[data-action="close"] {
-        color: #dc2626;
-        box-shadow: 0 12px 30px rgba(220, 38, 38, 0.22);
+        color: #be123c;
+        border-color: rgba(248, 113, 113, 0.4);
+        box-shadow: 0 12px 28px rgba(248, 113, 113, 0.3);
       }
       .drawaria-omni-header button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 16px 36px rgba(15, 23, 42, 0.24);
+        box-shadow: 0 14px 32px rgba(59, 130, 246, 0.24);
+        border-color: rgba(59, 130, 246, 0.4);
       }
       .drawaria-omni-header button:active {
         transform: translateY(1px) scale(0.96);
       }
       .drawaria-omni-tabs {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 12px;
-        padding: 14px 26px 10px;
-        background: linear-gradient(135deg, rgba(248, 250, 252, 0.9), rgba(226, 232, 240, 0.76));
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 10px;
+        padding: 14px 18px 10px;
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.85), rgba(224, 242, 254, 0.7));
         border-bottom: 1px solid rgba(148, 163, 184, 0.18);
-        backdrop-filter: blur(8px);
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.64);
+        box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.8);
       }
       .drawaria-omni-tabbtn {
         position: relative;
-        border: none;
-        border-radius: 16px;
-        padding: 11px 16px;
-        background: linear-gradient(145deg, rgba(255, 255, 255, 0.94), rgba(226, 232, 240, 0.78));
-        color: #1e293b;
-        font-weight: 600;
-        font-size: 13.5px;
-        letter-spacing: 0.2px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 14px;
+        padding: 10px 14px;
+        background: #ffffff;
+        color: #0f172a;
+        font-weight: 700;
+        font-size: 13px;
+        letter-spacing: 0.1px;
         cursor: pointer;
-        box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.7), 0 14px 22px rgba(148, 163, 184, 0.2);
-        transition: transform 120ms ease, box-shadow 160ms ease, color 150ms ease;
-        min-width: 102px;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+        transition: transform 120ms ease, box-shadow 160ms ease, color 150ms ease, border-color 140ms ease, background 140ms ease;
+        min-width: 116px;
       }
       .drawaria-omni-tabbtn.active {
-        color: #1d4ed8;
-        box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.32), 0 14px 26px rgba(59, 130, 246, 0.28);
+        color: #0c4a6e;
+        border-color: rgba(59, 130, 246, 0.6);
+        box-shadow: 0 12px 26px rgba(59, 130, 246, 0.18);
         transform: translateY(-1px);
+        background: linear-gradient(140deg, #e0edff, #f0f7ff);
       }
       .drawaria-omni-tabbtn::after {
         content: '';
         position: absolute;
-        inset-inline: 18px;
-        bottom: 6px;
-        height: 2px;
+        inset-inline: 16px;
+        bottom: 7px;
+        height: 3px;
         border-radius: 999px;
-        background: linear-gradient(90deg, rgba(59, 130, 246, 0.6), rgba(147, 197, 253, 0.4));
+        background: linear-gradient(90deg, rgba(59, 130, 246, 0.75), rgba(14, 165, 233, 0.75));
         opacity: 0;
         transition: opacity 160ms ease;
       }
@@ -1220,18 +1227,19 @@
         display: none;
       }
       .drawaria-omni-content {
-        padding: 22px 28px 24px;
+        padding: 18px 20px 20px;
         flex: 1;
         display: flex;
         position: relative;
         overflow: hidden;
         height: calc(100% - 180px);
+        background: linear-gradient(165deg, rgba(255, 255, 255, 0.92), rgba(240, 249, 255, 0.94));
       }
       .drawaria-omni-tab {
         display: none;
         overflow-y: auto;
         padding-right: 10px;
-        margin-right: -4px;
+        margin-right: -6px;
         height: 100%;
         width: 100%;
       }
@@ -1239,11 +1247,11 @@
         width: 8px;
       }
       .drawaria-omni-tab::-webkit-scrollbar-thumb {
-        background: rgba(148, 163, 184, 0.5);
+        background: rgba(148, 163, 184, 0.6);
         border-radius: 999px;
       }
       .drawaria-omni-tab::-webkit-scrollbar-track {
-        background: rgba(148, 163, 184, 0.1);
+        background: rgba(226, 232, 240, 0.5);
         border-radius: 999px;
       }
       .drawaria-omni-tab.active {
@@ -1252,13 +1260,13 @@
       }
       .drawaria-omni-section {
         display: grid;
-        gap: 20px;
+        gap: 18px;
         margin-bottom: 24px;
-        padding: 24px 22px 26px;
-        border-radius: 20px;
+        padding: 22px 22px 24px;
+        border-radius: 18px;
         border: 1.5px solid rgba(148, 163, 184, 0.25);
-        background: rgba(255, 255, 255, 0.92);
-        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+        background: linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(239, 246, 255, 0.94));
+        box-shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
       }
       .drawaria-omni-section:last-of-type {
         border-bottom: none;
@@ -1269,9 +1277,9 @@
         margin: 0;
         font-size: 16px;
         font-weight: 700;
-        letter-spacing: 0.3px;
-        color: #1f2937;
-        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+        letter-spacing: 0.15px;
+        color: #0f172a;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.22);
         padding-bottom: 12px;
       }
       .drawaria-omni-field {
@@ -1280,8 +1288,8 @@
       }
       .drawaria-omni-field label {
         font-size: 15px;
-        font-weight: 600;
-        color: #111827;
+        font-weight: 700;
+        color: #0f172a;
       }
       .drawaria-omni-field input[type="number"],
       .drawaria-omni-field input[type="text"],
@@ -1291,40 +1299,40 @@
         width: 100%;
         padding: 14px 16px;
         border-radius: 14px;
-        border: 1.5px solid rgba(148, 163, 184, 0.45);
+        border: 1.5px solid rgba(148, 163, 184, 0.4);
         font-size: 15px;
-        background: rgba(255, 255, 255, 0.97);
-        box-shadow: inset 0 2px 4px rgba(15, 23, 42, 0.08);
+        background: #ffffff;
+        box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.06);
         color: #0f172a;
-        line-height: 1.4;
+        line-height: 1.45;
       }
       .drawaria-omni-field textarea {
         resize: vertical;
-        min-height: 100px;
-        max-height: 220px;
+        min-height: 120px;
+        max-height: 240px;
       }
       .drawaria-omni-field small {
         font-size: 13px;
-        color: rgba(30, 41, 59, 0.78);
-        line-height: 1.5;
+        color: #334155;
+        line-height: 1.55;
       }
       .drawaria-omni-field input[type="range"] {
         padding: 0;
-        height: 6px;
-        accent-color: #3b82f6;
+        height: 8px;
+        accent-color: #0ea5e9;
       }
       .drawaria-omni-upload {
         display: grid;
-        gap: 12px;
-        padding: 16px;
+        gap: 14px;
+        padding: 18px;
         border-radius: 16px;
-        background: rgba(59, 130, 246, 0.1);
-        border: 2px dashed rgba(59, 130, 246, 0.4);
+        background: rgba(224, 242, 254, 0.8);
+        border: 2px dashed rgba(14, 165, 233, 0.45);
       }
       .drawaria-omni-upload strong {
         font-size: 14px;
-        font-weight: 600;
-        color: #1d4ed8;
+        font-weight: 700;
+        color: #0f172a;
       }
       .drawaria-omni-upload input[type="file"] {
         font-size: 14px;
@@ -1333,9 +1341,9 @@
         position: relative;
         border-radius: 18px;
         overflow: hidden;
-        background: rgba(15, 23, 42, 0.08);
-        border: 1.5px solid rgba(148, 163, 184, 0.22);
-        min-height: 280px;
+        background: linear-gradient(145deg, rgba(226, 232, 240, 0.6), rgba(241, 245, 249, 0.9));
+        border: 1.5px solid rgba(148, 163, 184, 0.26);
+        min-height: 320px;
         display: grid;
         place-items: center;
       }
@@ -1343,32 +1351,34 @@
         max-width: 100%;
         height: auto;
         border-radius: 12px;
+        box-shadow: 0 14px 32px rgba(15, 23, 42, 0.12);
       }
       .drawaria-omni-preview-controls {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 14px;
-        margin-top: 14px;
+        margin-top: 16px;
         width: 100%;
       }
       .drawaria-omni-button {
         border: none;
         padding: 12px 18px;
         border-radius: 14px;
-        background: linear-gradient(135deg, #2563eb, #7c3aed);
-        color: #ffffff;
-        font-weight: 600;
+        background: linear-gradient(135deg, #0ea5e9, #3b82f6);
+        color: #f8fafc;
+        font-weight: 700;
         font-size: 14px;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.25px;
         cursor: pointer;
-        box-shadow: 0 14px 24px rgba(37, 99, 235, 0.32);
+        box-shadow: 0 14px 30px rgba(14, 165, 233, 0.22);
         transition: transform 120ms ease, box-shadow 150ms ease, filter 150ms ease;
       }
       .drawaria-omni-button.secondary {
-        background: rgba(15, 23, 42, 0.12);
+        background: linear-gradient(135deg, #e0f2fe, #e2e8f0);
         color: #0f172a;
-        box-shadow: none;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.35);
       }
       .drawaria-omni-button:disabled {
         opacity: 0.55;
@@ -1377,14 +1387,14 @@
       }
       .drawaria-omni-button:not(:disabled):hover {
         transform: translateY(-1px);
-        box-shadow: 0 18px 32px rgba(37, 99, 235, 0.35);
+        box-shadow: 0 18px 36px rgba(14, 165, 233, 0.26);
       }
       .drawaria-omni-button:not(:disabled):active {
         transform: translateY(1px) scale(0.97);
       }
       .drawaria-omni-footer {
         padding: 22px 24px 24px;
-        background: linear-gradient(135deg, rgba(248, 250, 252, 0.9), rgba(236, 233, 254, 0.75));
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(224, 242, 254, 0.86));
         border-top: 1.5px solid rgba(148, 163, 184, 0.18);
         display: grid;
         gap: 18px;
@@ -1395,25 +1405,25 @@
       }
       .drawaria-omni-progress span {
         font-size: 13px;
-        color: rgba(15, 23, 42, 0.8);
-        letter-spacing: 0.3px;
-        font-weight: 600;
+        color: #0f172a;
+        letter-spacing: 0.2px;
+        font-weight: 700;
       }
       .drawaria-omni-conn {
         display: inline-flex;
         align-items: center;
         gap: 8px;
         font-size: 13px;
-        color: rgba(15, 23, 42, 0.75);
-        letter-spacing: 0.25px;
-        font-weight: 600;
+        color: #0f172a;
+        letter-spacing: 0.2px;
+        font-weight: 700;
       }
       .drawaria-omni-dot {
         width: 10px;
         height: 10px;
         border-radius: 50%;
-        background: rgba(148, 163, 184, 0.8);
-        box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.2);
+        background: rgba(148, 163, 184, 0.9);
+        box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.25);
       }
       .drawaria-omni-dot.online {
         background: rgba(34, 197, 94, 0.9);
@@ -1432,7 +1442,7 @@
         width: 100%;
         height: 12px;
         border-radius: 999px;
-        background: rgba(148, 163, 184, 0.22);
+        background: rgba(148, 163, 184, 0.3);
         overflow: hidden;
       }
       .drawaria-omni-progress-bar::after {
@@ -1440,7 +1450,7 @@
         position: absolute;
         inset: 0;
         width: var(--progress, 0%);
-        background: linear-gradient(90deg, rgba(37, 99, 235, 0.9), rgba(192, 132, 252, 0.9));
+        background: linear-gradient(90deg, rgba(59, 130, 246, 0.95), rgba(14, 165, 233, 0.95));
         transition: width 200ms ease;
       }
       .drawaria-omni-actions {
@@ -1450,38 +1460,38 @@
         flex-wrap: wrap;
       }
       .drawaria-omni-actions .drawaria-omni-button {
-        flex: 1 1 140px;
+        flex: 1 1 180px;
       }
       .drawaria-omni-stats {
         display: grid;
         gap: 12px;
         font-size: 14px;
-        line-height: 1.5;
-        color: rgba(15, 23, 42, 0.82);
+        line-height: 1.55;
+        color: #0f172a;
       }
       .drawaria-omni-note {
         font-size: 14px;
-        color: rgba(30, 41, 59, 0.78);
+        color: #1e293b;
         line-height: 1.5;
       }
       .drawaria-omni-fleet {
         padding: 16px;
         border-radius: 16px;
-        background: rgba(59, 130, 246, 0.1);
-        border: 1.5px solid rgba(96, 165, 250, 0.3);
+        background: rgba(224, 242, 254, 0.6);
+        border: 1.5px solid rgba(59, 130, 246, 0.26);
       }
       .drawaria-omni-fleet-item {
         display: grid;
         gap: 8px;
         padding: 14px 16px;
         border-radius: 14px;
-        background: rgba(255, 255, 255, 0.94);
-        border: 1.5px solid rgba(148, 163, 184, 0.25);
-        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+        background: #ffffff;
+        border: 1.5px solid rgba(148, 163, 184, 0.3);
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.1);
       }
       .drawaria-omni-fleet-item strong {
         font-size: 14px;
-        color: #1d4ed8;
+        color: #0f172a;
       }
       .drawaria-omni-fleet-actions {
         display: flex;
@@ -1492,16 +1502,16 @@
         border: none;
         border-radius: 12px;
         padding: 10px 14px;
-        font-weight: 600;
+        font-weight: 700;
         cursor: pointer;
-        background: linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(129, 140, 248, 0.2));
-        color: #1f2937;
-        box-shadow: 0 2px 6px rgba(59, 130, 246, 0.15);
+        background: linear-gradient(135deg, rgba(14, 165, 233, 0.22), rgba(59, 130, 246, 0.18));
+        color: #0f172a;
+        box-shadow: 0 8px 18px rgba(59, 130, 246, 0.16);
         transition: transform 120ms ease, box-shadow 160ms ease;
       }
       .drawaria-omni-fleet-actions button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 10px 20px rgba(59, 130, 246, 0.18);
+        box-shadow: 0 10px 20px rgba(59, 130, 246, 0.2);
       }
       @media (max-width: 720px) {
         .drawaria-omni-panel {
@@ -1528,7 +1538,7 @@
     const titleWrap = document.createElement('div');
     titleWrap.className = 'drawaria-omni-title';
     const title = document.createElement('strong');
-    title.textContent = 'OmniDraw Studio';
+    title.textContent = "Diabolical's Autodraw";
     const subtitle = document.createElement('span');
     subtitle.textContent = 'Autodraw anything at 650px precision';
     titleWrap.append(title, subtitle);
@@ -1650,7 +1660,7 @@
       const bitmap = await createImageBitmap(file);
       await loadImageBitmap(bitmap, file.name || 'uploaded image');
     } catch (err) {
-      console.error('OmniDraw failed to read image', err);
+      console.error("Diabolical's Autodraw failed to read image", err);
       alert('Could not read that file. Try a standard image such as PNG or JPEG.');
     }
   }
@@ -1663,7 +1673,7 @@
       const bitmap = await createImageBitmap(blob);
       await loadImageBitmap(bitmap, url);
     } catch (err) {
-      console.error('OmniDraw failed to fetch image', err);
+      console.error("Diabolical's Autodraw failed to fetch image", err);
       alert('Could not load that link. Make sure it is an image URL that allows cross-origin access.');
     }
   }
@@ -1712,6 +1722,36 @@
     return copy;
   }
 
+  function syncSettingInput(key) {
+    if (!key || !state.root) return;
+    const field = state.root.querySelector(`.drawaria-omni-field[data-setting="${key}"]`);
+    if (!field) return;
+    if (typeof field._refresh === 'function') {
+      try {
+        field._refresh();
+        return;
+      } catch (err) {
+        console.debug('Diabolical sync failed', err);
+      }
+    }
+    const input = field.querySelector('input, select, textarea');
+    if (input) {
+      input.value = String(state.config[key] ?? input.value);
+    }
+  }
+
+  function autoFitScaleToCanvas() {
+    if (!state.canvas || !state.image) return;
+    const rect = state.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const scaleX = rect.width / state.image.width;
+    const scaleY = rect.height / state.image.height;
+    const safeScale = Math.min(scaleX, scaleY) * 0.98;
+    const bounded = clamp(parseFloat(safeScale.toFixed(2)), 0.25, 1.6);
+    state.config.scale = bounded;
+    syncSettingInput('scale');
+  }
+
   async function loadImageBitmap(bitmap, label = 'image') {
     const fitted = fitBitmapToResolution(bitmap);
     const adjusted = lightenImageData(fitted.baseData, state.config.lighten);
@@ -1722,15 +1762,19 @@
       baseData: cloneImageData(fitted.baseData),
       data: adjusted,
     };
+    autoFitScaleToCanvas();
     updateImageInfo();
     await buildCommands();
     renderPreview(state.preview.drawnSegments);
   }
 
-  function createFieldNumber({ label, min, max, step, get, set, description, onChange }) {
+  function createFieldNumber({ label, min, max, step, get, set, description, onChange, settingId }) {
     const handler = onChange === undefined ? handleSettingsChange : onChange;
     const wrapper = document.createElement('div');
     wrapper.className = 'drawaria-omni-field';
+    if (settingId) {
+      wrapper.dataset.setting = settingId;
+    }
     const title = document.createElement('label');
     title.textContent = label;
     const input = document.createElement('input');
@@ -1749,6 +1793,9 @@
         input.value = String(get());
       }
     });
+    wrapper._refresh = () => {
+      input.value = String(get());
+    };
     wrapper.append(title, input);
     if (description) {
       const note = document.createElement('small');
@@ -1758,7 +1805,7 @@
     return wrapper;
   }
 
-  function createFieldRange({ label, min, max, step, unit = '', get, set, description, onChange, formatValue }) {
+  function createFieldRange({ label, min, max, step, unit = '', get, set, description, onChange, formatValue, settingId }) {
     const handler = onChange === undefined ? handleSettingsChange : onChange;
     const format = formatValue || ((value) => {
       if (Number.isInteger(value)) return String(value);
@@ -1766,6 +1813,9 @@
     });
     const wrapper = document.createElement('div');
     wrapper.className = 'drawaria-omni-field';
+    if (settingId) {
+      wrapper.dataset.setting = settingId;
+    }
     const title = document.createElement('label');
     const updateLabel = () => {
       title.textContent = `${label} (${format(get())}${unit})`;
@@ -1785,6 +1835,10 @@
         if (handler) handler(get());
       }
     });
+    wrapper._refresh = () => {
+      input.value = String(get());
+      updateLabel();
+    };
     wrapper.append(title, input);
     if (description) {
       const note = document.createElement('small');
@@ -1794,10 +1848,13 @@
     return wrapper;
   }
 
-  function createFieldSelect({ label, options, get, set, description, onChange }) {
+  function createFieldSelect({ label, options, get, set, description, onChange, settingId }) {
     const handler = onChange === undefined ? handleSettingsChange : onChange;
     const wrapper = document.createElement('div');
     wrapper.className = 'drawaria-omni-field';
+    if (settingId) {
+      wrapper.dataset.setting = settingId;
+    }
     const title = document.createElement('label');
     title.textContent = label;
     const select = document.createElement('select');
@@ -1814,6 +1871,9 @@
       set(select.value);
       if (handler) handler(get());
     });
+    wrapper._refresh = () => {
+      select.value = String(get());
+    };
     wrapper.append(title, select);
     if (description) {
       const note = document.createElement('small');
@@ -2012,11 +2072,11 @@
     nameLabel.textContent = 'Bot nickname';
     const nameInput = document.createElement('input');
     nameInput.type = 'text';
-    nameInput.placeholder = 'OmniDraw Bot';
-    nameInput.value = bot?.name || 'OmniDraw Bot';
+    nameInput.placeholder = "Diabolical's Autodraw Bot";
+    nameInput.value = bot?.name || "Diabolical's Autodraw Bot";
     nameInput.addEventListener('input', () => {
       if (!bot) return;
-      bot.name = nameInput.value.trim() || 'OmniDraw Bot';
+      bot.name = nameInput.value.trim() || "Diabolical's Autodraw Bot";
     });
     const nameHint = document.createElement('small');
     nameHint.textContent = 'Choose how the helper appears when it joins a room.';
@@ -2046,7 +2106,7 @@
     joinBtn.textContent = 'Join room';
     joinBtn.addEventListener('click', () => {
       if (!bot) return;
-      bot.name = nameInput.value.trim() || 'OmniDraw Bot';
+      bot.name = nameInput.value.trim() || "Diabolical's Autodraw Bot";
       bot.invite = inviteInput.value.trim();
       bot.player.annonymize(bot.name);
       bot.room.join(bot.invite);
@@ -2181,6 +2241,7 @@
       },
       description: '1× uses the 650px resolution. Adjust to shrink or enlarge.',
       onChange: () => updatePlacementInfo(),
+      settingId: 'scale',
       formatValue: (value) => value.toFixed(2).replace(/\.00$/, ''),
     });
 
@@ -2254,14 +2315,14 @@
       return;
     }
     const rect = state.canvas.getBoundingClientRect();
-    const drawWidth = Math.round(state.image.width * state.config.scale);
-    const drawHeight = Math.round(state.image.height * state.config.scale);
     const placement = computePlacement(rect);
+    const drawWidth = Math.round(state.image.width * placement.scale);
+    const drawHeight = Math.round(state.image.height * placement.scale);
     infoEl.innerHTML = `
       <div><strong>Board:</strong> ${Math.round(rect.width)} × ${Math.round(rect.height)} px</div>
       <div><strong>Drawing size:</strong> ${drawWidth} × ${drawHeight} px</div>
       <div><strong>Top-left:</strong> ${Math.round(placement.originX - rect.left)} px, ${Math.round(placement.originY - rect.top)} px</div>
-      <div><strong>Anchor:</strong> ${state.config.align.replace('-', ' ')}</div>
+      <div><strong>Scale:</strong> ${placement.scale.toFixed(2)}× · Anchor ${state.config.align.replace('-', ' ')}</div>
     `;
   }
 
@@ -2545,7 +2606,7 @@
       <div>2. Tweak path settings to balance speed and detail.</div>
       <div>3. Use the preview tab to watch the stroke order.</div>
       <div>4. Position the drawing with placement controls.</div>
-      <div>5. Press "Start drawing" and let OmniDraw paint for you.</div>
+      <div>5. Press "Start drawing" and let Diabolical's Autodraw paint for you.</div>
     `;
     section.append(title, list);
     tab.append(section);
@@ -2972,10 +3033,142 @@
       }
     };
 
+    const mergeSlack = Math.max(1, Math.round(step * 1.5));
+
+    const mergeAlignedSegments = (group) => {
+      const horizontals = [];
+      const verticals = [];
+      group.segments.forEach((seg) => {
+        if (seg.y1 === seg.y2) {
+          const start = Math.min(seg.x1, seg.x2);
+          const end = Math.max(seg.x1, seg.x2);
+          horizontals.push({ y: seg.y1, start, end });
+          return;
+        }
+        if (seg.x1 === seg.x2) {
+          const start = Math.min(seg.y1, seg.y2);
+          const end = Math.max(seg.y1, seg.y2);
+          verticals.push({ x: seg.x1, start, end });
+        }
+      });
+
+      const mergeLine = (lines, axis) => {
+        const sorted = lines.sort((a, b) => (a[axis] === b[axis] ? a.start - b.start : a[axis] - b[axis]));
+        const merged = [];
+        for (const line of sorted) {
+          const current = merged[merged.length - 1];
+          if (current && current[axis] === line[axis] && line.start <= current.end + mergeSlack) {
+            current.end = Math.max(current.end, line.end);
+          } else {
+            merged.push({ ...line });
+          }
+        }
+        return merged;
+      };
+
+      const mergedH = mergeLine(horizontals, 'y').map((line) => ({ x1: line.start, y1: line.y, x2: line.end, y2: line.y }));
+      const mergedV = mergeLine(verticals, 'x').map((line) => ({ x1: line.x, y1: line.start, x2: line.x, y2: line.end }));
+      group.segments = [...mergedH, ...mergedV];
+    };
+
+    const fillResidualIslands = () => {
+      const totalPixels = width * height;
+      const seen = visited;
+      const offsets = [1, -1, width, -width];
+      for (let idx = 0; idx < totalPixels; idx++) {
+        if (seen[idx]) continue;
+        const alpha = raw[idx * 4 + 3];
+        if (alpha < alphaThreshold) continue;
+        const queue = [idx];
+        seen[idx] = 1;
+        const members = [];
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let minX = width;
+        let minY = height;
+        let maxX = 0;
+        let maxY = 0;
+        while (queue.length) {
+          const current = queue.pop();
+          members.push(current);
+          const base = current * 4;
+          const r = raw[base];
+          const g = raw[base + 1];
+          const b = raw[base + 2];
+          sumR += r;
+          sumG += g;
+          sumB += b;
+          const cx = current % width;
+          const cy = Math.floor(current / width);
+          if (cx < minX) minX = cx;
+          if (cx > maxX) maxX = cx;
+          if (cy < minY) minY = cy;
+          if (cy > maxY) maxY = cy;
+          for (const off of offsets) {
+            const next = current + off;
+            if (next < 0 || next >= totalPixels) continue;
+            if (seen[next]) continue;
+            const ny = Math.floor(next / width);
+            const nx = next % width;
+            if (Math.abs(nx - cx) + Math.abs(ny - cy) !== 1) continue;
+            const nAlpha = raw[next * 4 + 3];
+            if (nAlpha < alphaThreshold) continue;
+            seen[next] = 1;
+            queue.push(next);
+          }
+        }
+        const count = members.length || 1;
+        const avgRgb = { r: Math.round(sumR / count), g: Math.round(sumG / count), b: Math.round(sumB / count) };
+        const group = obtainGroup(avgRgb);
+        const memberSet = new Set(members);
+        const horizontalPreference = (maxX - minX) >= (maxY - minY);
+        if (horizontalPreference) {
+          for (let y = minY; y <= maxY; y++) {
+            let x = minX;
+            while (x <= maxX) {
+              const idxAt = y * width + x;
+              if (!memberSet.has(idxAt)) {
+                x += 1;
+                continue;
+              }
+              let runStart = x;
+              let runEnd = x;
+              while (runEnd + 1 <= maxX && memberSet.has(y * width + runEnd + 1)) {
+                runEnd += 1;
+              }
+              pushSegment(group, runStart, y, runEnd, y);
+              x = runEnd + 1;
+            }
+          }
+        } else {
+          for (let x = minX; x <= maxX; x++) {
+            let y = minY;
+            while (y <= maxY) {
+              const idxAt = y * width + x;
+              if (!memberSet.has(idxAt)) {
+                y += 1;
+                continue;
+              }
+              let runStart = y;
+              let runEnd = y;
+              while (runEnd + 1 <= maxY && memberSet.has((runEnd + 1) * width + x)) {
+                runEnd += 1;
+              }
+              pushSegment(group, x, runStart, x, runEnd);
+              y = runEnd + 1;
+            }
+          }
+        }
+      }
+    };
+
     fillHorizontalGaps();
     fillVerticalGaps();
+    fillResidualIslands();
 
     const groupsArray = Array.from(groups.values()).filter((group) => group.segments.length > 0);
+    groupsArray.forEach(mergeAlignedSegments);
     groupsArray.sort((a, b) => b.pixelCount - a.pixelCount);
     const totalSegments = groupsArray.reduce((sum, group) => sum + group.segments.length, 0);
     state.commands = {
@@ -2998,7 +3191,9 @@
     if (!state.image) {
       return { originX: rect.left, originY: rect.top, scale: state.config.scale };
     }
-    const scale = state.config.scale;
+    const maxScaleX = rect.width / state.image.width;
+    const maxScaleY = rect.height / state.image.height;
+    const scale = clamp(Math.min(state.config.scale, maxScaleX * 0.98, maxScaleY * 0.98), 0.25, 1.6);
     const drawWidth = state.image.width * scale;
     const drawHeight = state.image.height * scale;
     let originX = rect.left;
@@ -3038,14 +3233,14 @@
     }
 
     if (!state.bot || state.bot.status !== 'connected') {
-      alert('Connect the OmniDraw bot from the Bot tab before drawing.');
+      alert("Connect the Diabolical's Autodraw bot from the Bot tab before drawing.");
       return;
     }
 
     const socket = getActiveSocket();
     if (!socket) {
       updateConnectionStatus();
-      alert('Join a drawing room first so OmniDraw can stream commands through the bot connection.');
+      alert("Join a drawing room first so Diabolical's Autodraw can stream commands through the bot connection.");
       return;
     }
     const ready = await waitForSocketReady(socket);
@@ -3073,7 +3268,7 @@
         if (state.abort) break;
         const ok = await ensureColor(group.hex);
         if (!ok) {
-          console.warn('OmniDraw: unable to activate palette color', group.hex);
+          console.warn("Diabolical's Autodraw: unable to activate palette color", group.hex);
         }
         await delay(Math.max(0, state.config.colorDelay));
 
@@ -3106,7 +3301,7 @@
         updateProgressDisplay('Completed! Ready for another run.', 1);
       }
     } catch (err) {
-      console.error('OmniDraw drawing error', err);
+      console.error("Diabolical's Autodraw drawing error", err);
       const ratio = total ? state.progress.segments / total : 0;
       updateProgressDisplay('Error: ' + err.message, ratio);
       alert('Drawing failed: ' + err.message);
@@ -3140,7 +3335,7 @@
         try {
           state.bot.room.leave();
         } catch (err) {
-          console.debug('OmniDraw bot leave error', err);
+          console.debug("Diabolical's Autodraw bot leave error", err);
         }
       }
       clearScoutBots();
@@ -3206,5 +3401,5 @@
     preview: startPreviewPlayback,
   };
 
-  console.info('%cOmniDraw Studio ready', 'color:#2563eb;font-weight:bold;', 'Load an image to begin.');
+  console.info("%cDiabolical's Autodraw ready", 'color:#c084fc;font-weight:bold;', 'Load an image to begin.');
 })();
